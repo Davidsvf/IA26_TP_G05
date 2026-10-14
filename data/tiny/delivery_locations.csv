@@ -1,0 +1,7 @@
+delivery_location_id,name,locality_id,address,location_type
+1,Mercado Municipal 1,21,"Largo de Grijó, 987",market
+2,Casa 2,31,"Av Azevedo, 3",home
+3,Casa 3,2,"Travessa Valentina Jesus, 58",home
+4,Casa 4,25,"Largo de Batista, 83",home
+5,Casa 5,27,"Largo Andrade, 71",home
+6,Casa 6,17,"Largo Francisco Ramos, 26",home

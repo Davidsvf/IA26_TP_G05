@@ -1,0 +1,13 @@
+location_id,location_type,ref_id,name,municipality,latitude,longitude
+1,producer,1,Hortas Valente,Fafe,41.463574,-8.15984
+2,producer,2,Quinta Leite,Vieira do Minho,41.62798,-8.166483
+3,producer,3,Quinta Morais,Guimaraes,41.464457,-8.29774
+4,producer,4,Pomar Carvalho,Povoa de Varzim,41.398757,-8.765766
+5,producer,5,Pomar Antunes,Fafe,41.463574,-8.15984
+6,collection_center,1,Centro de Recolha 1,Terras de Bouro,41.716185,-8.340221
+7,delivery_location,1,Mercado Municipal 1,Esposende,41.561427,-8.763803
+8,delivery_location,2,Casa 2,Vila Verde,41.63245,-8.43326
+9,delivery_location,3,Casa 3,Braga,41.564989,-8.435147
+10,delivery_location,4,Casa 4,Vizela,41.399802,-8.274785
+11,delivery_location,5,Casa 5,Amares,41.653024,-8.33689
+12,delivery_location,6,Casa 6,Vila Nova de Famalicao,41.394239,-8.52032
