@@ -242,16 +242,6 @@ class Problem:
             return r.delivery_location
         return self.warehouse_location
 
-    def subset(self, order_ids):
-        if isinstance(order_ids, int):
-            order_ids = list(self.orders)[:order_ids]
-        wanted = set(order_ids)
-        return Problem(
-            [r for r in self.requests if r.order_id in wanted],
-            self.vehicles, self.distances, self.durations,
-            self.warehouse_location, self.rules, self.names,
-            self.warehouse_capacity
-        )
 
     def validate(self):
         issues = []
