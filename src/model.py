@@ -1,25 +1,57 @@
-from collections import defaultdict, namedtuple
+"""
+model_simples.py  --  versão simplificada do modelo do problema
+================================================================
+Faz o mesmo que o model.py (mesmas regras, mesmos resultados), mas com menos
+código. Não tem nada específico de nenhum algoritmo (sem heurísticas, sem
+agrupamentos de recolha, sem caminhos mais curtos): serve de base ao Greedy,
+A*, Hill-Climbing e CSP.
+
+Como se usa:
+    problem = Problem.from_csv("data_tiny")
+    valida, km, mensagem = check_solution(problem, solucao)
+    custo = solution_cost(problem, solucao)        # km, ou infinito se inválida
+
+Uma solução é um dicionário  {id_do_veículo: [(operação, id_do_item), ...]}
+Todo o item faz 4 operações, sempre por esta ordem:
+    pickup  -> recolher no produtor
+    unload  -> descarregar no armazém
+    load    -> carregar no armazém (para ir ao cliente)
+    deliver -> entregar ao cliente
+"""
+
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 
-from src.data_loader import load_data
+import pandas as pd
 
 PICKUP, UNLOAD, LOAD, DELIVER = "pickup", "unload", "load", "deliver"
 OPERATIONS = (PICKUP, UNLOAD, LOAD, DELIVER)
+RETURN = "return"                       # regresso final ao armazém
 
+# Onde está cada item ao longo da sua "viagem"
 NEW, PICKED, STORED, LOADED, DELIVERED = range(5)
 
-WAIT = "wait"      # ainda falta outra operação (ex.: outro veículo descarregar)
-BROKEN = "rule"    # viola uma regra do problema
+# Estado em que o item tem de estar para se poder fazer cada operação
+REQUIRED_STATUS = {PICKUP: NEW, UNLOAD: PICKED, LOAD: STORED, DELIVER: LOADED}
+
+# Tipos de recusa: WAIT = "ainda não" (falta outro veículo fazer algo),
+#                  BROKEN = "viola uma regra"
+WAIT, BROKEN = "wait", "rule"
+
+
+# 1) Fichas simples
 
 @dataclass
 class Vehicle:
     id: int
     capacity_kg: float
-    center_id: int          # armazém de onde parte e onde termina
+
 
 @dataclass
 class Request:
+    """Um item de uma encomenda: o que levar, de onde, para onde e quando."""
     id: int
     order_id: int
     pickup_location: int
@@ -30,629 +62,429 @@ class Request:
     delivery_start: datetime
     delivery_end: datetime
 
+
 @dataclass
-class PickupGroup:
-    location: int
-    ids: tuple
-    start: datetime         # abertura comum (a mais tardia)
-    end: datetime           # fecho comum (o mais cedo)
-    weight_kg: float
+class Stop:
+    """Uma paragem já feita por um veículo (serve para registo e impressão)."""
+    action: str
+    place: int
+    arrival: datetime       # chegada ao local
+    start: datetime         # início do serviço (no "return": hora de saída do último local)
+    finish: datetime        # fim do serviço
+    items: tuple
+    km: float               # km percorridos para chegar a esta paragem
 
-class State:
 
-    def __init__(self, time, place, load, stop, status, owner,
-                 stored_at, ready_at, routes, distance=0.0, last=None):
-        self.time = time              # veículo -> hora a que fica livre
-        self.place = place            # veículo -> localização atual
-        self.load = load              # veículo -> kg a bordo
-        self.stop = stop              # veículo -> última paragem (ver apply_stop)
-        self.status = status          # item -> NEW/PICKED/STORED/LOADED/DELIVERED
-        self.owner = owner            # item -> veículo que o transporta
-        self.stored_at = stored_at    # item -> chegada ao armazém (limite de 24h)
-        self.ready_at = ready_at      # item -> fim da descarga no armazém
-        self.routes = routes          # veículo -> [(operação, item), ...]
-        self.distance = distance      # g(n): km percorridos até aqui
-        self.last = last              # descrição da última paragem (para registos)
-
-    def copy(self):
-        return State(
-            self.time.copy(), self.place.copy(), self.load.copy(),
-            self.stop.copy(), self.status.copy(), self.owner.copy(),
-            self.stored_at.copy(), self.ready_at.copy(),
-            {v: route[:] for v, route in self.routes.items()},
-            self.distance, self.last
-        )
-
-    def key(self):
-        status = self.status
-        return (
-            tuple(self.time.values()),
-            tuple(self.place.values()),
-            tuple(round(x, 6) for x in self.load.values()),
-            tuple(
-                None if s is None
-                else (s[0], s[1], s[2], s[3], tuple(sorted(s[4])))
-                for s in self.stop.values()
-            ),
-            tuple(status.values()),
-            tuple(self.owner.values()),
-            tuple(
-                (self.stored_at[i], self.ready_at[i]) if status[i] == STORED else None
-                for i in status
-            ),
-        )
-
-def build_pickup_groups(requests):
-    by_place = defaultdict(list)
-    for r in requests:
-        by_place[r.pickup_location].append(r)
-
-    groups = []
-    for place, items in by_place.items():
-        items = sorted(items, key=lambda r: (r.pickup_end, r.id))
-        while items:
-            deadline = items[0].pickup_end
-            chosen = [r for r in items if r.pickup_start <= deadline]
-            items = [r for r in items if r.pickup_start > deadline]
-            groups.append(PickupGroup(
-                location=place,
-                ids=tuple(r.id for r in chosen),
-                start=max(r.pickup_start for r in chosen),
-                end=min(r.pickup_end for r in chosen),
-                weight_kg=sum(r.weight_kg for r in chosen),
-            ))
-
-    groups.sort(key=lambda g: (g.end, g.location))
-    return groups
-
+# 2) Problem: tudo o que NÃO muda durante o planeamento
 class Problem:
 
-    def __init__(self, requests, vehicles, distances, durations,
-                 warehouse_location, rules=None, names=None,
-                 warehouse_capacity=None):
-
+    def __init__(self, requests, vehicles, km, minutes, warehouse,
+                 rules=None, names=None):
         self.requests = list(requests)
         self.vehicles = list(vehicles)
-        self.distances = distances
-        self.durations = durations
-        self.warehouse_location = warehouse_location
-        self.warehouse_capacity = warehouse_capacity
+        self.km = km                    # (origem, destino) -> km
+        self.minutes = minutes          # (origem, destino) -> minutos
+        self.warehouse = warehouse      # id do local do armazém
         self.rules = rules or {}
         self.names = names or {}
 
         self.request = {r.id: r for r in self.requests}
         self.vehicle = {v.id: v for v in self.vehicles}
 
-        orders = defaultdict(list)
+        self.orders = {}                # id da encomenda -> ids dos seus itens
         for r in self.requests:
-            orders[r.order_id].append(r.id)
-        self.orders = {o: tuple(ids) for o, ids in orders.items()}
+            self.orders.setdefault(r.order_id, []).append(r.id)
 
-        self.pickup_groups = build_pickup_groups(self.requests)
-        self.group_of = {
-            i: n for n, g in enumerate(self.pickup_groups) for i in g.ids
-        }
-
-        self.stop_service = timedelta(
-            minutes=float(self.rules.get("stop_service_min", 10)))
-        self.warehouse_service = timedelta(
-            minutes=float(self.rules.get("warehouse_handling_min", 15)))
-        self.dwell_max = timedelta(
+        # Regras do rules.csv
+        minutes_rule = lambda key, default: timedelta(
+            minutes=float(self.rules.get(key, default)))
+        self.service = minutes_rule("stop_service_min", 10)         # produtor/cliente
+        self.handling = minutes_rule("warehouse_handling_min", 15)  # armazém
+        self.max_dwell = timedelta(
             hours=float(self.rules.get("max_warehouse_dwell_h", 24)))
 
+        # Início e fim do planeamento
         if "start_date" in self.rules:
-            self.start_time = datetime.fromisoformat(self.rules["start_date"])
+            self.start = datetime.fromisoformat(self.rules["start_date"])
         else:
             first = min(r.pickup_start for r in self.requests)
-            self.start_time = first.replace(hour=0, minute=0, second=0,
-                                            microsecond=0)
-
+            self.start = first.replace(hour=0, minute=0, second=0, microsecond=0)
         if "horizon_days" in self.rules:
-            days = int(self.rules["horizon_days"])
+            days = int(float(self.rules["horizon_days"]))
         else:
             last = max(r.delivery_end for r in self.requests)
-            days = (last.date() - self.start_time.date()).days + 1
-        self.horizon = self.start_time + timedelta(days=days)
+            days = (last.date() - self.start.date()).days + 1
+        self.horizon = self.start + timedelta(days=days)
 
-        self._travel = {}
-        self._lower = self._shortest_times()
-        self._lower_km = self._shortest_km()
+    # --- consultas -----------------------------------------------------
+    def distance(self, a, b):
+        return 0.0 if a == b else self.km[a, b]          # KeyError se não existir
 
-    def get_distance(self, a, b):
-        if a == b:
-            return 0.0
-        return self.distances[a, b]
+    def travel(self, a, b):
+        return timedelta(minutes=0 if a == b else self.minutes[a, b])
 
-    def get_duration(self, a, b):
-        if a == b:
-            return 0.0
-        return self.durations[a, b]
-
-    def travel_time(self, a, b):
-        pair = (a, b)
-        if pair not in self._travel:
-            self._travel[pair] = timedelta(minutes=self.get_duration(a, b))
-        return self._travel[pair]
-
-    def _shortest_times(self):
-        places = {self.warehouse_location}
-        places |= {r.pickup_location for r in self.requests}
-        places |= {r.delivery_location for r in self.requests}
-        places = sorted(places)
-        inf = float("inf")
-        best = {(a, b): (0.0 if a == b else self.durations.get((a, b), inf))
-                for a in places for b in places}
-        for k in places:
-            for a in places:
-                for b in places:
-                    if best[a, k] + best[k, b] < best[a, b]:
-                        best[a, b] = best[a, k] + best[k, b]
-        return {pair: timedelta(minutes=m) for pair, m in best.items() if m < inf}
-
-    def _shortest_km(self):
-        places = sorted({self.warehouse_location}
-                        | {r.pickup_location for r in self.requests}
-                        | {r.delivery_location for r in self.requests})
-        inf = float("inf")
-        best = {(a, b): (0.0 if a == b else self.distances.get((a, b), inf))
-                for a in places for b in places}
-        for k in places:
-            for a in places:
-                for b in places:
-                    if best[a, k] + best[k, b] < best[a, b]:
-                        best[a, b] = best[a, k] + best[k, b]
-        return best
-
-    def lower_distance(self, a, b):
-        return self._lower_km.get((a, b), float("inf"))
-
-    def lower_travel(self, a, b):
-        return self._lower.get((a, b))
-
-    def name(self, location):
-        return self.names.get(location, f"local {location}")
-
-    def initial_state(self, start_time=None):
-        if start_time is None:
-            start_time = self.start_time
-
-        times = {}
-        for v in self.vehicles:
-            t = start_time[v.id] if isinstance(start_time, dict) else start_time
-            times[v.id] = t
-
-        ids = [r.id for r in self.requests]
-        return State(
-            time=times,
-            place={v.id: self.warehouse_location for v in self.vehicles},
-            load={v.id: 0.0 for v in self.vehicles},
-            stop={v.id: None for v in self.vehicles},
-            status={i: NEW for i in ids},
-            owner={i: None for i in ids},
-            stored_at={i: None for i in ids},
-            ready_at={i: None for i in ids},
-            routes={v.id: [] for v in self.vehicles},
-        )
-
-    def stop_place(self, action, request_id):
-        r = self.request[request_id]
+    def place_of(self, action, request):
+        """Onde se faz cada operação."""
         if action == PICKUP:
-            return r.pickup_location
+            return request.pickup_location
         if action == DELIVER:
-            return r.delivery_location
-        return self.warehouse_location
+            return request.delivery_location
+        return self.warehouse                            # unload e load
 
+    def name(self, place):
+        return self.names.get(place, f"local {place}")
 
     def validate(self):
+        """Verificações simples aos dados. Lista vazia = nada de errado detetado
+        (não garante que exista solução)."""
         issues = []
         biggest = max(v.capacity_kg for v in self.vehicles)
-
-        for g in self.pickup_groups:
-            if g.weight_kg > biggest:
-                issues.append(f"Recolha em {self.name(g.location)} pesa "
-                              f"{g.weight_kg:.1f} kg (> {biggest} kg)")
-
         for order, ids in self.orders.items():
-            weight = sum(self.request[i].weight_kg for i in ids)
-            if weight > biggest:
-                issues.append(f"Encomenda {order} pesa {weight:.1f} kg "
-                              f"(> {biggest} kg)")
-            start = max(self.request[i].delivery_start for i in ids)
-            end = min(self.request[i].delivery_end for i in ids)
-            if start > end:
+            reqs = [self.request[i] for i in ids]
+            if sum(r.weight_kg for r in reqs) > biggest:
+                issues.append(f"Encomenda {order} pesa mais que o maior veículo")
+            if max(r.delivery_start for r in reqs) > min(r.delivery_end for r in reqs):
                 issues.append(f"Encomenda {order} sem janela de entrega comum")
-
-        places = {self.warehouse_location}
+        places = {self.warehouse}
         places |= {r.pickup_location for r in self.requests}
         places |= {r.delivery_location for r in self.requests}
         for a in places:
             for b in places:
-                if a != b and (a, b) not in self.distances:
+                if a != b and (a, b) not in self.km:
                     issues.append(f"Falta a distância {a} -> {b}")
-
-        total = sum(r.weight_kg for r in self.requests)
-        if self.warehouse_capacity is not None and total > self.warehouse_capacity:
-            issues.append(f"Peso total ({total:.1f} kg) excede a capacidade "
-                          f"do armazém ({self.warehouse_capacity} kg), "
-                          f"que não é verificada")
         return issues
 
+    def initial_state(self, start_time=None):
+        return State(self, start_time or self.start)
+
+    # --- leitura dos CSV -----------------------------------------------
     @classmethod
     def from_csv(cls, folder):
+        folder = Path(folder)
+        if not folder.is_dir():
+            raise FileNotFoundError(f"Pasta não encontrada: {folder}")
+        t = {f.stem: pd.read_csv(f) for f in sorted(folder.glob("*.csv"))}
 
-        data = load_data(folder)
+        # Cada local (produtor, cliente, armazém) tem um location_id, que é o
+        # número usado na matriz de distâncias.
+        locations = t["locations"]
+        place_id = {(row.location_type, int(row.ref_id)): int(row.location_id)
+                    for row in locations.itertuples()}
+        names = {int(i): str(n) for i, n in zip(locations.location_id, locations.name)}
 
-        producers = {}      # producer_id -> location_id
-        deliveries = {}     # delivery_location_id -> location_id
-        centers = {}        # center_id -> location_id
-        names = {}
+        vehicles = [Vehicle(int(v.vehicle_id), float(v.capacity_kg))
+                    for v in t["vehicles"].itertuples()]
+        centers = set(t["vehicles"]["center_id"])
+        if len(centers) != 1:
+            raise ValueError("Só é suportado um armazém")
+        warehouse = place_id["collection_center", int(centers.pop())]
 
-        for _, row in data["locations"].iterrows():
-
-            location = int(row["location_id"])
-            ref = int(row["ref_id"])
-            names[location] = str(row["name"])
-
-            if row["location_type"] == "producer":
-                producers[ref] = location
-            elif row["location_type"] == "delivery_location":
-                deliveries[ref] = location
-            elif row["location_type"] == "collection_center":
-                centers[ref] = location
-
-        vehicles = [
-            Vehicle(
-                id=int(row["vehicle_id"]),
-                capacity_kg=float(row["capacity_kg"]),
-                center_id=int(row["center_id"]),
-            )
-            for _, row in data["vehicles"].iterrows()
-        ]
-
-        used = {v.center_id for v in vehicles}
-        if len(used) != 1:
-            raise ValueError(
-                "Só é suportado um armazém; veículos usam os centros "
-                f"{sorted(used)}")
-        center_id = used.pop()
-        if center_id not in centers:
-            raise ValueError(f"Centro de recolha {center_id} não existe em locations.csv")
-        warehouse = centers[center_id]
-
-        capacity = None
-        if "collection_centers" in data:
-            table = data["collection_centers"].set_index("center_id")
-            if center_id in table.index and "capacity_kg" in table.columns:
-                capacity = float(table.loc[center_id, "capacity_kg"])
-
-        products = data["products"].set_index("product_id")
-        orders = data["orders"].set_index("order_id")
-
+        products = t["products"].set_index("product_id")
+        orders = t["orders"].set_index("order_id")
         requests = []
-
-        for _, row in data["order_items"].iterrows():
-
-            product = products.loc[int(row["product_id"])]
-            order = orders.loc[int(row["order_id"])]
-
-            if "weight_kg" in row.index:
-                weight = float(row["weight_kg"])
-            else:
-                weight = float(row["quantity"]) * float(product["unit_weight_kg"])
-
+        for it in t["order_items"].itertuples():
+            if "weight_kg" in t["order_items"].columns:
+                weight = float(it.weight_kg)
+            else:                                   # peso = quantidade x peso unitário
+                weight = float(it.quantity) * float(
+                    products.loc[it.product_id, "unit_weight_kg"])
+            producer = int(products.loc[it.product_id, "producer_id"])
+            delivery = int(orders.loc[it.order_id, "delivery_location_id"])
+            when = [datetime.fromisoformat(str(x)) for x in (
+                it.availability_start, it.availability_end,
+                it.delivery_start, it.delivery_end)]
             requests.append(Request(
-                id=int(row["order_item_id"]),
-                order_id=int(row["order_id"]),
-                pickup_location=producers[int(product["producer_id"])],
-                delivery_location=deliveries[int(order["delivery_location_id"])],
-                weight_kg=weight,
-                pickup_start=datetime.fromisoformat(str(row["availability_start"])),
-                pickup_end=datetime.fromisoformat(str(row["availability_end"])),
-                delivery_start=datetime.fromisoformat(str(row["delivery_start"])),
-                delivery_end=datetime.fromisoformat(str(row["delivery_end"])),
-            ))
+                int(it.order_item_id), int(it.order_id),
+                place_id["producer", producer],
+                place_id["delivery_location", delivery],
+                weight, *when))
 
-        distances = {}
-        durations = {}
-
-        for _, row in data["distance_matrix"].iterrows():
-            pair = (int(row["origin_location_id"]),
-                    int(row["destination_location_id"]))
-            distances[pair] = float(row["distance_km"])
-            durations[pair] = float(row["duration_min"])
+        dm = t["distance_matrix"]
+        pairs = list(zip(dm.origin_location_id.astype(int),
+                         dm.destination_location_id.astype(int)))
+        km = dict(zip(pairs, dm.distance_km.astype(float)))
+        minutes = dict(zip(pairs, dm.duration_min.astype(float)))
 
         rules = {}
-        if "rules" in data:
-            for _, row in data["rules"].iterrows():
-                rules[str(row["rule"])] = str(row["value"])
+        if "rules" in t:
+            rules = {str(r): str(v) for r, v in zip(t["rules"].rule, t["rules"].value)}
 
-        return cls(requests, vehicles, distances, durations,
-                   warehouse, rules, names, capacity)
+        return cls(requests, vehicles, km, minutes, warehouse, rules, names)
 
-def check_capacity(vehicle, load):
-    return -0.000001 <= load <= vehicle.capacity_kg + 0.000001
 
-def check_time_window(arrival, start, end):
-    return max(arrival, start) <= end
 
-def apply_stop(problem, state, vehicle_id, action, ids):
-    ids = tuple(ids)
-    new, why = _apply(problem, state, vehicle_id, action, ids, True)
+# 3) State
 
-    if new is None and why[0] == BROKEN:
-        stop = state.stop[vehicle_id]
-        if stop is not None and stop[0] == action and action in OPERATIONS \
-                and stop[1] == problem.stop_place(action, ids[0]):
-            retry = _apply(problem, state, vehicle_id, action, ids, False)
-            if retry[0] is not None:
-                return retry
-    return new, why
+class State:
 
-def _apply(problem, state, vehicle_id, action, ids, allow_extend):
-    request = problem.request
-    warehouse = problem.warehouse_location
-    status, owner = state.status, state.owner
+    def __init__(self, problem, start_time):
+        v_ids = [v.id for v in problem.vehicles]
+        r_ids = [r.id for r in problem.requests]
+        # por veículo
+        self.time = {v: start_time for v in v_ids}              # hora a que fica livre
+        self.place = {v: problem.warehouse for v in v_ids}      # onde está
+        self.load = {v: 0.0 for v in v_ids}                     # kg a bordo
+        self.stops = {v: [] for v in v_ids}                     # paragens já feitas
+        # por item
+        self.status = {i: NEW for i in r_ids}                   # NEW ... DELIVERED
+        self.owner = {i: None for i in r_ids}                   # veículo que o leva
+        self.stored_at = {i: None for i in r_ids}               # chegada ao armazém
+        self.ready_at = {i: None for i in r_ids}                # fim da descarga
+        self.km = 0.0                                           # km percorridos
 
-    # 1) Situação dos itens e local da operação
-    if action == PICKUP:
-        if any(status[i] != NEW for i in ids):
-            return None, (WAIT, "item já recolhido")
-    elif action == UNLOAD:
-        if any(status[i] != PICKED or owner[i] != vehicle_id for i in ids):
-            return None, (WAIT, "item não está neste veículo")
-    elif action == LOAD:
-        if any(status[i] != STORED for i in ids):
-            return None, (WAIT, "item ainda não está no armazém")
-    elif action == DELIVER:
-        if any(status[i] != LOADED or owner[i] != vehicle_id for i in ids):
-            return None, (WAIT, "item não foi carregado neste veículo")
-    else:
-        return None, (BROKEN, "operação desconhecida")
+    def copy(self):
+        return deepcopy(self)
 
-    place = problem.stop_place(action, ids[0])
-    if any(problem.stop_place(action, i) != place for i in ids):
-        return None, (BROKEN, "itens de locais diferentes na mesma paragem")
 
+# 4) As regras: o que acontece quando um veículo faz uma paragem
+
+def wrong_status(s, v, action, ids):
+    """Devolve um motivo se algum item ainda não está pronto para esta operação."""
+    for i in ids:
+        if s.status[i] != REQUIRED_STATUS[action]:
+            return "item ainda não está na fase certa"
+        if action in (UNLOAD, DELIVER) and s.owner[i] != v:
+            return "item não está neste veículo"
+    return None
+
+
+def _try_stop(p, s, v, action, ids, merge):
+    """Tenta fazer uma paragem do veículo v. Se correr bem, altera o estado s
+    e devolve None. Se não, devolve (tipo, motivo) e NÃO altera nada."""
+    why = wrong_status(s, v, action, ids)
+    if why:
+        return WAIT, why
+
+    # Todos os itens da paragem têm de ser do mesmo local
+    place = p.place_of(action, p.request[ids[0]])
+    if any(p.place_of(action, p.request[i]) != place for i in ids):
+        return BROKEN, "itens de locais diferentes na mesma paragem"
+
+    # Carregar/entregar: as encomendas vão sempre inteiras
     if action in (LOAD, DELIVER):
-        chosen = set(ids)
-        for order in {request[i].order_id for i in ids}:
-            if not set(problem.orders[order]) <= chosen:
-                return None, (BROKEN, f"encomenda {order} dividida")
+        for order in {p.request[i].order_id for i in ids}:
+            if not set(p.orders[order]) <= set(ids):
+                return BROKEN, f"encomenda {order} dividida"
 
-    # 2) Chegada: junta-se à paragem anterior ou viaja até ao local
-    stop = state.stop[vehicle_id]
-    extend = (allow_extend and stop is not None
-              and stop[0] == action and stop[1] == place)
+    prev = s.stops[v][-1] if s.stops[v] else None
+    # Operações iguais seguidas no mesmo local contam como UMA só paragem
+    merge = merge and prev is not None and prev.action == action and prev.place == place
 
+    # Chegada
     try:
-        if extend:
-            arrival, members, leg = stop[2], stop[4] + ids, 0.0
-            stop_leg = stop[5]
+        if merge:
+            arrival, members, leg = prev.arrival, prev.items + tuple(ids), 0.0
         else:
-            origin = state.place[vehicle_id]
-            arrival = state.time[vehicle_id] + problem.travel_time(origin, place)
-            members = ids
-            leg = stop_leg = problem.get_distance(origin, place)
-        back = problem.travel_time(place, warehouse)
+            arrival = s.time[v] + p.travel(s.place[v], place)
+            members, leg = tuple(ids), p.distance(s.place[v], place)
+        back = p.travel(place, p.warehouse)
     except KeyError:
-        return None, (BROKEN, "percurso inexistente na matriz de distâncias")
+        return BROKEN, "percurso inexistente na matriz de distâncias"
 
-    # 3) Início do serviço (espera pela abertura da janela) e janelas
+    # Início do serviço: espera pela abertura da janela, mas não pode chegar
+    # depois do fecho
+    group = [p.request[i] for i in members]
     if action == PICKUP:
-        window = (max(request[i].pickup_start for i in members),
-                  min(request[i].pickup_end for i in members))
-        if not check_time_window(arrival, *window):
-            return None, (BROKEN, "janela de recolha ultrapassada")
-        start = max(arrival, window[0])
-
+        opens = max(r.pickup_start for r in group)
+        closes = min(r.pickup_end for r in group)
     elif action == DELIVER:
-        window = (max(request[i].delivery_start for i in members),
-                  min(request[i].delivery_end for i in members))
-        if not check_time_window(arrival, *window):
-            return None, (BROKEN, "janela de entrega ultrapassada")
-        start = max(arrival, window[0])
-
+        opens = max(r.delivery_start for r in group)
+        closes = min(r.delivery_end for r in group)
+    if action in (PICKUP, DELIVER):
+        if max(arrival, opens) > closes:
+            return BROKEN, "janela de tempo ultrapassada"
+        start = max(arrival, opens)
     elif action == LOAD:
-        start = max([arrival] + [state.ready_at[i] for i in members])
-        if any(start - state.stored_at[i] > problem.dwell_max for i in members):
-            return None, (BROKEN, "mais de 24h no armazém")
-
-    else:
+        # só se pode carregar depois de tudo estar descarregado...
+        start = max([arrival] + [s.ready_at[i] for i in members])
+        # ...e nenhum item pode estar mais de 24h no armazém
+        if any(start - s.stored_at[i] > p.max_dwell for i in members):
+            return BROKEN, "mais de 24h no armazém"
+    else:                                   # unload
         start = arrival
 
-    if action in (PICKUP, DELIVER):
-        finish = start + problem.stop_service
+    finish = start + (p.service if action in (PICKUP, DELIVER) else p.handling)
+    if finish + back > p.horizon:
+        return BROKEN, "fora do horizonte de planeamento"
+
+    # Capacidade
+    weight = sum(p.request[i].weight_kg for i in ids)
+    new_load = s.load[v] + (weight if action in (PICKUP, LOAD) else -weight)
+    if not -1e-6 <= new_load <= p.vehicle[v].capacity_kg + 1e-6:
+        return BROKEN, "capacidade do veículo excedida"
+
+    # Tudo certo: atualizar o estado
+    s.time[v], s.place[v], s.load[v] = finish, place, max(0.0, new_load)
+    s.km += leg
+    stop = Stop(action, place, arrival, start, finish, members,
+                leg if not merge else prev.km)
+    if merge:
+        s.stops[v][-1] = stop
     else:
-        finish = start + problem.warehouse_service
-
-    if finish + back > problem.horizon:
-        return None, (BROKEN, "fora do horizonte de planeamento")
-
-    # 4) Capacidade
-    weight = sum(request[i].weight_kg for i in ids)
-    if action in (PICKUP, LOAD):
-        new_load = state.load[vehicle_id] + weight
-    else:
-        new_load = state.load[vehicle_id] - weight
-
-    if not check_capacity(problem.vehicle[vehicle_id], new_load):
-        return None, (BROKEN, "capacidade do veículo excedida")
-
-    # 5) Novo estado
-    new = state.copy()
-    new.time[vehicle_id] = finish
-    new.place[vehicle_id] = place
-    new.load[vehicle_id] = max(0.0, new_load)
-    new.stop[vehicle_id] = (action, place, arrival, start, members, stop_leg)
-    new.distance += leg
-    new.last = (vehicle_id, action, place, members, arrival, start, finish,
-                stop_leg, extend)
+        s.stops[v].append(stop)
 
     for i in ids:
-        new.routes[vehicle_id].append((action, i))
-
         if action == PICKUP:
-            new.status[i] = PICKED
-            new.owner[i] = vehicle_id
+            s.status[i], s.owner[i] = PICKED, v
         elif action == UNLOAD:
-            new.status[i] = STORED
-            new.owner[i] = None
-            new.stored_at[i] = arrival      # as 24h contam desde a chegada
+            s.status[i], s.owner[i], s.stored_at[i] = STORED, None, arrival
         elif action == LOAD:
-            new.status[i] = LOADED
-            new.owner[i] = vehicle_id
+            s.status[i], s.owner[i] = LOADED, v
         else:
-            new.status[i] = DELIVERED
-            new.owner[i] = None
-
+            s.status[i], s.owner[i] = DELIVERED, None
     if action == UNLOAD:
-        for i in members:                   # disponível quando acaba a descarga
-            new.ready_at[i] = finish
+        for i in members:
+            s.ready_at[i] = finish
+    return None
 
-    return new, None
 
-def apply_run(problem, state, vehicle_id, action, ids):
-    if action in (LOAD, DELIVER):          # encomendas inteiras
-        by_order = {}
-        for i in ids:
-            by_order.setdefault(problem.request[i].order_id, []).append(i)
-        units = list(by_order.values())
-    else:
-        units = [[i] for i in ids]
+def apply_stop(p, s, v, action, ids):
+    """Faz uma paragem. Tenta juntá-la à anterior (mesmo local e operação);
+    se a junção violar uma janela, faz uma paragem separada.
+    Devolve None se correu bem, ou (tipo, motivo) se não."""
+    # Validar os argumentos antes de mexer em qualquer coisa
+    if v not in p.vehicle:
+        return BROKEN, f"veículo desconhecido: {v}"
+    if action not in OPERATIONS:
+        return BROKEN, f"operação desconhecida: {action}"
+    ids = list(ids)
+    if not ids:
+        return BROKEN, "lista de itens vazia"
+    unknown = [i for i in ids if i not in p.request]
+    if unknown:
+        return BROKEN, f"item desconhecido: {unknown[0]}"
+    if len(set(ids)) != len(ids):
+        return BROKEN, "itens repetidos na mesma paragem"
 
-    events = []
-    for unit in units:
-        new, why = apply_stop(problem, state, vehicle_id, action, unit)
-        if new is None:
-            return None, None, why
-        if new.last[8] and events:          # juntou-se à paragem anterior
-            events[-1] = new.last[:8]
+    error = _try_stop(p, s, v, action, ids, merge=True)
+    if error and error[0] == BROKEN and _try_stop(p, s, v, action, ids, merge=False) is None:
+        return None
+    return error
+
+
+# 5) O "fiscal": verifica uma solução completa
+
+def _stops_of(p, route):
+    """Junta operações iguais seguidas no mesmo local: [(operação, local, [itens])]"""
+    blocks = []
+    for action, i in route:
+        place = p.place_of(action, p.request[i])
+        if blocks and blocks[-1][0] == action and blocks[-1][1] == place:
+            blocks[-1][2].append(i)
         else:
-            events.append(new.last[:8])
-        state = new
-    return state, events, None
+            blocks.append((action, place, [i]))
+    return blocks
 
-Result = namedtuple("Result", "valid distance message events")
 
-def simulate(problem, solution, start_time=None, check_all=True):
-    events = []
-
+def simulate(p, solution, check_all=True, start_time=None):
+    """Simula a solução. Devolve (válida?, estado final, mensagem)."""
     def fail(message, state=None):
-        distance = round(state.distance, 2) if state else 0.0
-        return Result(False, distance, message, events)
+        return False, state, message
 
-    for vehicle_id in solution:
-        if vehicle_id not in problem.vehicle:
-            return fail(f"Veículo desconhecido: {vehicle_id}")
-
-    stops = {v.id: [] for v in problem.vehicles}
-    seen = set()
-
-    for vehicle_id, route in solution.items():
-        for action, request_id in route:
-
-            if request_id not in problem.request:
-                return fail(f"Produto desconhecido: {request_id}")
+    # 1) Verificações básicas
+    seen, blocks = set(), {v.id: [] for v in p.vehicles}
+    for v, route in solution.items():
+        if v not in p.vehicle:
+            return fail(f"Veículo desconhecido: {v}")
+        for action, i in route:
+            if i not in p.request:
+                return fail(f"Item desconhecido: {i}")
             if action not in OPERATIONS:
                 return fail(f"Operação desconhecida: {action}")
-            if (action, request_id) in seen:
-                return fail(f"Operação repetida: {action} {request_id}")
-            seen.add((action, request_id))
+            if (action, i) in seen:
+                return fail(f"Operação repetida: {action} {i}")
+            seen.add((action, i))
+        blocks[v] = _stops_of(p, route)
 
-            place = problem.stop_place(action, request_id)
-            last = stops[vehicle_id][-1] if stops[vehicle_id] else None
-
-            if last and last[0] == action and last[1] == place:
-                last[2].append(request_id)
-            else:
-                stops[vehicle_id].append((action, place, [request_id]))
-
-    active = {request_id for _, request_id in seen}
-
-    if check_all and active != set(problem.request):
+    active = {i for _, i in seen}
+    if check_all and active != set(p.request):
         return fail("Encomendas por entregar")
-
-    for request_id in active:
-        order = problem.request[request_id].order_id
-        if not set(problem.orders[order]) <= active:
+    for i in active:
+        order = p.request[i].order_id
+        if not set(p.orders[order]) <= active:
             return fail(f"Encomenda {order} incompleta")
-        for action in OPERATIONS:
-            if (action, request_id) not in seen:
-                return fail(f"Faltam operações no item {request_id}")
+        if any((action, i) not in seen for action in OPERATIONS):
+            return fail(f"Faltam operações no item {i}")
 
-    if start_time is None:
-        start_time = problem.start_time
+    # 2) Simulação: cada veículo avança enquanto puder; se está à espera de
+    #    outro veículo (ex.: item ainda não chegou ao armazém), passa-se ao seguinte
+    s = p.initial_state(start_time)
+    if not all(p.start <= t < p.horizon for t in s.time.values()):
+        return fail("Partida fora do horizonte de planeamento")
 
-    state = problem.initial_state(start_time)
+    pos = {v: 0 for v in blocks}
+    while any(pos[v] < len(blocks[v]) for v in blocks):
+        moved = False
+        for v in blocks:
+            while pos[v] < len(blocks[v]):
+                action, place, ids = blocks[v][pos[v]]
+                if wrong_status(s, v, action, ids):
+                    break                                   # à espera de outro veículo
+                if action in (PICKUP, UNLOAD):
+                    units = [[i] for i in ids]              # item a item
+                else:                                       # load/deliver: encomendas inteiras
+                    by_order = {}
+                    for i in ids:
+                        by_order.setdefault(p.request[i].order_id, []).append(i)
+                    units = list(by_order.values())
+                for unit in units:
+                    error = apply_stop(p, s, v, action, unit)
+                    if error:
+                        return fail(f"Veículo {v}, {action} {unit}: {error[1]}", s)
+                pos[v] += 1
+                moved = True
+        if not moved:
+            return fail("Ordem das operações inválida", s)
 
-    for t in state.time.values():
-        if not problem.start_time <= t < problem.horizon:
-            return fail("Partida fora do horizonte de planeamento")
+    if not all(st in (NEW, DELIVERED) for st in s.status.values()):
+        return fail("Produtos por entregar", s)
 
-    index = {v: 0 for v in stops}
-
-    while any(index[v] < len(stops[v]) for v in stops):
-
-        best = None
-
-        for vehicle_id in stops:
-            if index[vehicle_id] >= len(stops[vehicle_id]):
-                continue
-
-            action, _, ids = stops[vehicle_id][index[vehicle_id]]
-            new, new_events, why = apply_run(problem, state, vehicle_id, action, ids)
-
-            if new is None:
-                if why[0] == BROKEN:
-                    return fail(f"Veículo {vehicle_id}, {action} {ids}: {why[1]}", state)
-                continue    # depende de outro veículo
-
-            if best is None or new.time[vehicle_id] < best[1].time[best[0]]:
-                best = (vehicle_id, new, new_events)
-
-        if best is None:
-            return fail("Ordem das operações inválida", state)
-
-        vehicle_id, state, new_events = best
-        events.extend(new_events)
-        index[vehicle_id] += 1
-
-    if not all(s in (NEW, DELIVERED) for s in state.status.values()):
-        return fail("Produtos por entregar", state)
-
-    warehouse = problem.warehouse_location
-
-    for vehicle_id in stops:
-        place = state.place[vehicle_id]
-
+    # 3) Regresso de todos os veículos ao armazém
+    for v in blocks:
         try:
-            leg = problem.get_distance(place, warehouse)
-            arrival = state.time[vehicle_id] + problem.travel_time(place, warehouse)
+            leg = p.distance(s.place[v], p.warehouse)
+            arrival = s.time[v] + p.travel(s.place[v], p.warehouse)
         except KeyError:
-            return fail("Regresso sem percurso", state)
-
-        if arrival > problem.horizon:
-            return fail("Regresso fora do horizonte", state)
-
+            return fail("Regresso sem percurso na matriz", s)
+        if arrival > p.horizon:
+            return fail("Regresso fora do horizonte", s)
         if leg > 0:
-            events.append((vehicle_id, "return", warehouse, (), state.time[vehicle_id],
-                           state.time[vehicle_id], arrival, leg))
-        state.distance += leg
-        state.time[vehicle_id] = arrival
+            s.stops[v].append(Stop(RETURN, p.warehouse, arrival, s.time[v], arrival, (), leg))
+        s.km += leg
+        s.time[v], s.place[v] = arrival, p.warehouse
 
-    message = "Solução válida" if check_all else "Rotas válidas"
-    return Result(True, round(state.distance, 2), message, events)
+    return True, s, "Solução válida" if check_all else "Rotas válidas"
 
-def check_solution(problem, solution, start_time=None, check_all=True):
-    result = simulate(problem, solution, start_time, check_all)
-    return result.valid, result.distance, result.message
 
-def check_route(problem, vehicle, route, start_time=None):
-    if vehicle.id not in problem.vehicle:
+def check_solution(p, solution, start_time=None, check_all=True):
+    """(válida?, km totais, mensagem)"""
+    ok, s, message = simulate(p, solution, check_all, start_time)
+    return ok, round(s.km, 2) if s else 0.0, message
+
+
+def check_route(p, vehicle, route, start_time=None):
+    """Valida a rota de um só veículo (sem exigir que entregue tudo)."""
+    if vehicle.id not in p.vehicle:
         return False, 0.0, "Veículo desconhecido"
-    return check_solution(problem, {vehicle.id: route}, start_time, check_all=False)
+    return check_solution(p, {vehicle.id: route}, start_time, check_all=False)
 
-def solution_cost(problem, solution, start_time=None):
-    valid, distance, _ = check_solution(problem, solution, start_time)
-    return distance if valid else float("inf")
-    
+
+def solution_cost(p, solution, start_time=None):
+    """Função de custo: km totais se a solução é válida, infinito se não for."""
+    ok, km, _ = check_solution(p, solution, start_time)
+    return km if ok else float("inf")
+
+
+def print_solution(p, solution):
+    """Mostra o plano de cada veículo: hora, operação, local, itens e km."""
+    ok, s, message = simulate(p, solution)
+    print(message, f"| total: {round(s.km, 2) if s else 0} km")
+    if not s:
+        return
+    for v, stops in s.stops.items():
+        print(f"\nVeículo {v} (capacidade {p.vehicle[v].capacity_kg:.0f} kg)")
+        for st in stops:
+            when = st.arrival if st.action == RETURN else st.start
+            hour = when.strftime("%d/%m %H:%M")
+            items = list(st.items) if st.items else ""
+            print(f"  {hour}  {st.action:<8} {p.name(st.place):<28} {str(items):<24} +{st.km:.1f} km")
