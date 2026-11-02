@@ -1,40 +1,16 @@
-"""Modelo do problema de recolha e entrega de produtos locais.
-
-Contém as entidades (Vehicle, Request, State, Problem), a função de custo e
-a verificação de rotas. Nada aqui depende de um dataset em particular: tudo
-é lido dos CSV (incluindo rules.csv), por isso o mesmo código serve para
-data_tiny, data_small ou qualquer outro dataset com o mesmo formato.
-
-Fluxo de cada item:   produtor -> armazém -> local de entrega
-    pickup   recolher o item no produtor
-    unload   descarregá-lo no armazém
-    load     carregar a encomenda (inteira) no armazém
-    deliver  entregar a encomenda (inteira) ao cliente
-
-CUSTO = distância total, em km, percorrida por todos os veículos (incluindo
-o regresso final de cada veículo ao armazém). O tempo NÃO entra no custo:
-só serve para validar janelas, horizonte e permanência no armazém.
-"""
-
 from collections import defaultdict, namedtuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from src.data_loader import load_data
 
-# Operações possíveis numa rota
 PICKUP, UNLOAD, LOAD, DELIVER = "pickup", "unload", "load", "deliver"
 OPERATIONS = (PICKUP, UNLOAD, LOAD, DELIVER)
 
-# Situação de cada item
 NEW, PICKED, STORED, LOADED, DELIVERED = range(5)
 
-# Tipo de motivo quando uma paragem não pode ser executada
 WAIT = "wait"      # ainda falta outra operação (ex.: outro veículo descarregar)
 BROKEN = "rule"    # viola uma regra do problema
-
-
-# Entidades
 
 @dataclass
 class Vehicle:
@@ -42,10 +18,8 @@ class Vehicle:
     capacity_kg: float
     center_id: int          # armazém de onde parte e onde termina
 
-
 @dataclass
 class Request:
-    """Um item de encomenda (linha de order_items.csv)."""
     id: int
     order_id: int
     pickup_location: int
@@ -56,25 +30,15 @@ class Request:
     delivery_start: datetime
     delivery_end: datetime
 
-
 @dataclass
 class PickupGroup:
-    """Itens do mesmo produtor com uma janela de recolha comum.
-
-    Uma única paragem no produtor recolhe todos os itens do grupo.
-    """
     location: int
     ids: tuple
     start: datetime         # abertura comum (a mais tardia)
     end: datetime           # fecho comum (o mais cedo)
     weight_kg: float
 
-
 class State:
-    """Estado do planeamento: onde está cada veículo e em que ponto está cada item.
-
-    Os veículos e os itens são identificados pelos ids dos CSV.
-    """
 
     def __init__(self, time, place, load, stop, status, owner,
                  stored_at, ready_at, routes, distance=0.0, last=None):
@@ -100,14 +64,14 @@ class State:
         )
 
     def key(self):
-        """Identifica o estado pelo presente (não pela ordem em que lá se chegou)."""
         status = self.status
         return (
             tuple(self.time.values()),
             tuple(self.place.values()),
             tuple(round(x, 6) for x in self.load.values()),
             tuple(
-                None if s is None else (s[0], s[1], s[3], tuple(sorted(s[4])))
+                None if s is None
+                else (s[0], s[1], s[2], s[3], tuple(sorted(s[4])))
                 for s in self.stop.values()
             ),
             tuple(status.values()),
@@ -118,15 +82,7 @@ class State:
             ),
         )
 
-# Problema
-
 def build_pickup_groups(requests):
-    """Agrupa os itens de cada produtor em grupos com janela de recolha comum.
-
-    Em cada produtor ordena os itens pelo fecho da janela e junta-lhes todos
-    os que já estão abertos nesse instante. Se todos os itens de um produtor
-    (num dia) partilharem uma janela, fica um grupo por produtor/dia.
-    """
     by_place = defaultdict(list)
     for r in requests:
         by_place[r.pickup_location].append(r)
@@ -149,7 +105,6 @@ def build_pickup_groups(requests):
     groups.sort(key=lambda g: (g.end, g.location))
     return groups
 
-
 class Problem:
 
     def __init__(self, requests, vehicles, distances, durations,
@@ -168,19 +123,16 @@ class Problem:
         self.request = {r.id: r for r in self.requests}
         self.vehicle = {v.id: v for v in self.vehicles}
 
-        # Itens de cada encomenda
         orders = defaultdict(list)
         for r in self.requests:
             orders[r.order_id].append(r.id)
         self.orders = {o: tuple(ids) for o, ids in orders.items()}
 
-        # Grupos de recolha por produtor
         self.pickup_groups = build_pickup_groups(self.requests)
         self.group_of = {
             i: n for n, g in enumerate(self.pickup_groups) for i in g.ids
         }
 
-        # Regras (lidas de rules.csv; os valores por omissão são os dos datasets)
         self.stop_service = timedelta(
             minutes=float(self.rules.get("stop_service_min", 10)))
         self.warehouse_service = timedelta(
@@ -206,33 +158,23 @@ class Problem:
         self._lower = self._shortest_times()
         self._lower_km = self._shortest_km()
 
-    # ---------------- distâncias e tempos ----------------
-
     def get_distance(self, a, b):
         if a == b:
             return 0.0
         return self.distances[a, b]
 
     def get_duration(self, a, b):
-        """Duração da viagem em minutos."""
         if a == b:
             return 0.0
         return self.durations[a, b]
 
     def travel_time(self, a, b):
-        """Duração da viagem como timedelta (com cache)."""
         pair = (a, b)
         if pair not in self._travel:
             self._travel[pair] = timedelta(minutes=self.get_duration(a, b))
         return self._travel[pair]
 
     def _shortest_times(self):
-        """Menor tempo possível entre locais (Floyd-Warshall sobre a matriz).
-
-        Serve para a poda de viabilidade: é um limite inferior, por isso nunca
-        rejeita um estado que ainda tenha solução, mesmo que a matriz tenha
-        uma ligação indireta mais rápida do que a direta.
-        """
         places = {self.warehouse_location}
         places |= {r.pickup_location for r in self.requests}
         places |= {r.delivery_location for r in self.requests}
@@ -248,7 +190,6 @@ class Problem:
         return {pair: timedelta(minutes=m) for pair, m in best.items() if m < inf}
 
     def _shortest_km(self):
-        """Menor distância (km) possível entre locais (Floyd-Warshall)."""
         places = sorted({self.warehouse_location}
                         | {r.pickup_location for r in self.requests}
                         | {r.delivery_location for r in self.requests})
@@ -263,25 +204,15 @@ class Problem:
         return best
 
     def lower_distance(self, a, b):
-        """Limite inferior da distância entre dois locais (km), para heurísticas
-        admissíveis. Infinito se não houver percurso."""
         return self._lower_km.get((a, b), float("inf"))
 
     def lower_travel(self, a, b):
-        """Limite inferior do tempo de viagem (None se não houver percurso)."""
         return self._lower.get((a, b))
 
     def name(self, location):
         return self.names.get(location, f"local {location}")
 
-    # ---------------- estado inicial ----------------
-
     def initial_state(self, start_time=None):
-        """Todos os veículos no armazém, à hora de partida, sem nada feito.
-
-        start_time pode ser uma data/hora (igual para todos) ou um dicionário
-        veículo -> data/hora. Por omissão usa o início do horizonte (rules.csv).
-        """
         if start_time is None:
             start_time = self.start_time
 
@@ -304,7 +235,6 @@ class Problem:
         )
 
     def stop_place(self, action, request_id):
-        """Localização onde a operação é feita."""
         r = self.request[request_id]
         if action == PICKUP:
             return r.pickup_location
@@ -313,10 +243,6 @@ class Problem:
         return self.warehouse_location
 
     def subset(self, order_ids):
-        """Problema só com algumas encomendas (útil para testar com menos dados).
-
-        order_ids pode ser uma lista de ids ou um inteiro N (as primeiras N).
-        """
         if isinstance(order_ids, int):
             order_ids = list(self.orders)[:order_ids]
         wanted = set(order_ids)
@@ -328,7 +254,6 @@ class Problem:
         )
 
     def validate(self):
-        """Devolve uma lista de avisos sobre a coerência da instância."""
         issues = []
         biggest = max(v.capacity_kg for v in self.vehicles)
 
@@ -362,8 +287,6 @@ class Problem:
                           f"que não é verificada")
         return issues
 
-    # ---------------- leitura dos CSV ----------------
-
     @classmethod
     def from_csv(cls, folder):
 
@@ -396,7 +319,6 @@ class Problem:
             for _, row in data["vehicles"].iterrows()
         ]
 
-        # O armazém é identificado pelo id do centro de recolha dos veículos
         used = {v.center_id for v in vehicles}
         if len(used) != 1:
             raise ValueError(
@@ -457,40 +379,13 @@ class Problem:
         return cls(requests, vehicles, distances, durations,
                    warehouse, rules, names, capacity)
 
-
-# Custo e verificações elementares
-
-def route_cost(problem, locations):
-    """Custo de um percurso: soma das distâncias (km) entre localizações."""
-    total = 0.0
-    for i in range(len(locations) - 1):
-        total += problem.get_distance(locations[i], locations[i + 1])
-    return round(total, 2)
-
-
 def check_capacity(vehicle, load):
     return -0.000001 <= load <= vehicle.capacity_kg + 0.000001
 
-
 def check_time_window(arrival, start, end):
-    """O serviço pode começar dentro da janela [start, end]? (espera se cedo)"""
     return max(arrival, start) <= end
 
-
-# Regras de uma paragem 
-
 def apply_stop(problem, state, vehicle_id, action, ids):
-    """Faz o veículo ir ao local da operação e executá-la sobre os itens ids.
-
-    Devolve (novo_estado, None) se for possível, ou (None, (tipo, motivo)).
-    É aqui que estão TODAS as regras: ordem das operações, capacidade,
-    janelas de recolha/entrega, 24h no armazém, tempos de serviço, encomendas
-    carregadas e entregues por inteiro e horizonte de planeamento.
-
-    Se a última paragem do veículo foi do mesmo tipo e no mesmo local, tenta-se
-    juntar a operação a essa paragem (serviço feito uma só vez). Se juntar
-    violar uma janela ou as 24h, faz-se uma paragem nova no mesmo local.
-    """
     ids = tuple(ids)
     new, why = _apply(problem, state, vehicle_id, action, ids, True)
 
@@ -502,7 +397,6 @@ def apply_stop(problem, state, vehicle_id, action, ids):
             if retry[0] is not None:
                 return retry
     return new, why
-
 
 def _apply(problem, state, vehicle_id, action, ids, allow_extend):
     request = problem.request
@@ -529,7 +423,6 @@ def _apply(problem, state, vehicle_id, action, ids, allow_extend):
     if any(problem.stop_place(action, i) != place for i in ids):
         return None, (BROKEN, "itens de locais diferentes na mesma paragem")
 
-    # A encomenda é carregada e entregue por inteiro
     if action in (LOAD, DELIVER):
         chosen = set(ids)
         for order in {request[i].order_id for i in ids}:
@@ -582,7 +475,6 @@ def _apply(problem, state, vehicle_id, action, ids, allow_extend):
     else:
         finish = start + problem.warehouse_service
 
-    # O veículo tem de conseguir terminar e regressar ao armazém no horizonte
     if finish + back > problem.horizon:
         return None, (BROKEN, "fora do horizonte de planeamento")
 
@@ -629,14 +521,7 @@ def _apply(problem, state, vehicle_id, action, ids, allow_extend):
 
     return new, None
 
-
 def apply_run(problem, state, vehicle_id, action, ids):
-    """Executa operações consecutivas do mesmo tipo e local (uma sequência da rota).
-
-    Vai juntando à mesma paragem enquanto as janelas deixam; quando não deixam,
-    começa outra paragem no mesmo local. Devolve (estado, eventos, None) ou
-    (None, None, (tipo, motivo)).
-    """
     if action in (LOAD, DELIVER):          # encomendas inteiras
         by_order = {}
         for i in ids:
@@ -657,19 +542,9 @@ def apply_run(problem, state, vehicle_id, action, ids):
         state = new
     return state, events, None
 
-
-# Verificação de soluções
-
 Result = namedtuple("Result", "valid distance message events")
 
-
 def simulate(problem, solution, start_time=None, check_all=True):
-    """Executa as rotas e valida-as. Devolve Result(valid, distance, message, events).
-
-    solution: {veículo: [(operação, item), ...]}. Operações consecutivas do
-    mesmo tipo e local formam uma só paragem. Os veículos são independentes,
-    exceto no armazém: um veículo só carrega o que outro já descarregou.
-    """
     events = []
 
     def fail(message, state=None):
@@ -680,7 +555,6 @@ def simulate(problem, solution, start_time=None, check_all=True):
         if vehicle_id not in problem.vehicle:
             return fail(f"Veículo desconhecido: {vehicle_id}")
 
-    # Agrupar as operações de cada veículo em paragens
     stops = {v.id: [] for v in problem.vehicles}
     seen = set()
 
@@ -703,7 +577,6 @@ def simulate(problem, solution, start_time=None, check_all=True):
             else:
                 stops[vehicle_id].append((action, place, [request_id]))
 
-    # Cada item incluído tem de fazer o percurso completo
     active = {request_id for _, request_id in seen}
 
     if check_all and active != set(problem.request):
@@ -717,7 +590,6 @@ def simulate(problem, solution, start_time=None, check_all=True):
             if (action, request_id) not in seen:
                 return fail(f"Faltam operações no item {request_id}")
 
-    # Simulação (o veículo cuja próxima paragem termina primeiro avança)
     if start_time is None:
         start_time = problem.start_time
 
@@ -758,7 +630,6 @@ def simulate(problem, solution, start_time=None, check_all=True):
     if not all(s in (NEW, DELIVERED) for s in state.status.values()):
         return fail("Produtos por entregar", state)
 
-    # Regresso de cada veículo ao armazém
     warehouse = problem.warehouse_location
 
     for vehicle_id in stops:
@@ -782,21 +653,16 @@ def simulate(problem, solution, start_time=None, check_all=True):
     message = "Solução válida" if check_all else "Rotas válidas"
     return Result(True, round(state.distance, 2), message, events)
 
-
 def check_solution(problem, solution, start_time=None, check_all=True):
-    """Devolve (válida, distância total em km, mensagem)."""
     result = simulate(problem, solution, start_time, check_all)
     return result.valid, result.distance, result.message
 
-
 def check_route(problem, vehicle, route, start_time=None):
-    """Valida a rota de um único veículo (não exige entregar tudo)."""
     if vehicle.id not in problem.vehicle:
         return False, 0.0, "Veículo desconhecido"
     return check_solution(problem, {vehicle.id: route}, start_time, check_all=False)
 
-
 def solution_cost(problem, solution, start_time=None):
-    """Custo de uma solução completa: km totais, ou infinito se for inválida."""
     valid, distance, _ = check_solution(problem, solution, start_time)
     return distance if valid else float("inf")
+    
