@@ -1,11 +1,4 @@
 """
-model_simples.py  --  versão simplificada do modelo do problema
-================================================================
-Faz o mesmo que o model.py (mesmas regras, mesmos resultados), mas com menos
-código. Não tem nada específico de nenhum algoritmo (sem heurísticas, sem
-agrupamentos de recolha, sem caminhos mais curtos): serve de base ao Greedy,
-A*, Hill-Climbing e CSP.
-
 Como se usa:
     problem = Problem.from_csv("data_tiny")
     valida, km, mensagem = check_solution(problem, solucao)
