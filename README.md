@@ -16,124 +16,83 @@
 
 ## 1. Descrição do Projeto
 
-O presente projeto tem como objetivo desenvolver um agente inteligente para o planeamento de rotas de recolha e distribuição de produtos alimentares locais.
+O projeto planeia as rotas de veículos que **recolhem** produtos alimentares em produtores locais, os levam ao **armazém** (centro de recolha) e os **entregam** aos clientes.
 
-O problema envolve produtores que disponibilizam produtos, clientes que realizam encomendas e veículos responsáveis pelo transporte entre diferentes localizações.
+**Objetivo:** encontrar rotas válidas que **minimizem os km percorridos**.
 
-Pretende-se encontrar rotas válidas e eficientes, respeitando as restrições logísticas e temporais estabelecidas no enunciado.
+O problema é resolvido e comparado com quatro técnicas de Inteligência Artificial:
 
-Para a resolução do problema, serão utilizadas e comparadas diferentes técnicas de Inteligência Artificial:
-
-- **Greedy Best-First Search**
-- **A\* Search**
-- **Hill-Climbing**
-- **Constraint Satisfaction Problem (CSP)**
+- **Greedy Best-First Search** (pesquisa informada)
+- **A\*** (pesquisa informada)
+- **Hill-Climbing** (pesquisa local)
+- **CSP** — Problema de Satisfação de Restrições (backtracking, forward checking e AC-3)
 
 ## 2. Definição do Problema
 
-O planeamento das rotas deve respeitar o seguinte percurso obrigatório:
+Percurso obrigatório de cada produto:
 
-**Produtor → Centro de Recolha → Local de Entrega**
+**Produtor → Armazém → Local de entrega**
 
-As principais restrições do problema incluem:
+Restrições:
 
-- **Janelas temporais:** as operações de recolha e entrega devem começar dentro dos intervalos definidos.
-- **Capacidade dos veículos:** a carga transportada não pode ultrapassar a capacidade máxima permitida.
-- **Ordem das operações:** os produtos devem ser recolhidos e passar pelo centro de recolha antes da entrega.
-- **Tempos de serviço:** devem ser considerados os tempos necessários para recolha, entrega, carga e descarga.
-- **Armazenamento:** os produtos não podem permanecer no centro de recolha durante mais de 24 horas.
-- **Distâncias e tempos de viagem:** devem ser considerados os valores presentes na matriz de distâncias.
+- **Janelas de tempo:** a recolha e a entrega começam dentro da janela de cada item.
+- **Capacidade:** a carga de um veículo nunca ultrapassa a sua capacidade.
+- **Encomendas inteiras:** cada encomenda é carregada e entregue de uma só vez.
+- **Armazém:** um produto não pode ficar mais de **24 horas** no armazém.
+- **Horizonte:** 2 dias (30 e 31 de outubro de 2026); os veículos começam e acabam no armazém.
+- **Tempos de serviço:** 10 min em produtores e clientes, 15 min para descarregar ou carregar no armazém.
 
-O objetivo será encontrar soluções viáveis e eficientes, avaliadas através de uma função de custo a definir na fase de modelação.
+**Função de custo:** km totais percorridos, incluindo o regresso ao armazém.
 
-## 3. Dataset
+## 3. Datasets
 
-O projeto utiliza um dataset sintético fornecido pelo docente, organizado em ficheiros CSV.
+| | tiny | small |
+|---|---:|---:|
+| Produtores | 3 | 6 |
+| Locais de entrega | 5 | 7 |
+| Encomendas | 12 | 25 |
+| Itens | 40 | 80 |
+| Veículos (capacidade) | 2 (150 e 200 kg) | 2 (250 e 300 kg) |
+| Localizações | 9 | 14 |
 
-Nesta fase é utilizado o dataset `small`, composto por:
+Cada dataset tem 12 ficheiros CSV, incluindo o `rules.csv` com as regras do problema.
 
-| Entidade | Quantidade |
-|---|---:|
-| Produtores | 6 |
-| Clientes | 21 |
-| Produtos | 31 |
-| Encomendas | 25 |
-| Itens de encomenda | 80 |
-| Centros de recolha | 1 |
-| Veículos | 2 |
-| Localizações | 14 |
-| Pares origem-destino | 182 |
-
-O dataset inclui também o ficheiro `rules.csv`, que contém as regras operacionais do problema.
-
-### Análise Exploratória dos Dados (EDA)
-
-Foi realizada uma análise exploratória utilizando Python, Pandas, NumPy e Matplotlib, com os seguintes objetivos:
-
-- Analisar a estrutura e as dimensões dos dados;
-- Verificar valores em falta e duplicados;
-- Validar as relações entre as tabelas;
-- Verificar a consistência dos pesos;
-- Analisar as janelas temporais;
-- Comparar os pesos das encomendas com as capacidades dos veículos;
-- Representar geograficamente as localizações;
-- Validar a matriz de distâncias e tempos de viagem.
-
-Os resultados e respetivas conclusões encontram-se no notebook `01_eda_tiny.ipynb`.
-
-## 4. Estrutura do Repositório
+## 4. Estrutura do Projeto
 
 ```text
-IA2026_TP_G05/
-│
-├── Proj01.ipynb
-├── EDA.ipynb
+IA26_P01_G05/
 ├── README.md
-│
-└── data/
-    ├── collection_centers.csv
-    ├── customers.csv
-    ├── delivery_locations.csv
-    ├── distance_matrix.csv
-    ├── localities.csv
-    ├── locations.csv
-    ├── order_items.csv
-    ├── orders.csv
-    ├── producers.csv
-    ├── products.csv
-    ├── rules.csv
-    └── vehicles.csv
+├── data_tiny/                     # 12 ficheiros CSV do dataset tiny
+├── data_small/                    # 12 ficheiros CSV do dataset small
+├── src/
+│   ├── model.py                   # modelo do problema e verificação das soluções
+│   ├── informed.py                # Greedy Best-First Search e A*
+│   ├── local_search.py            # Hill-Climbing
+│   └── csp.py                     # CSP: backtracking, forward checking e AC-3
+└── notebooks/
+    ├── 01_Project01_G05.ipynb     # notebook principal: resumo, modelação, resultados e conclusão
+    ├── 02_eda_tiny.ipynb          # análise exploratória do tiny
+    ├── 02_eda_small.ipynb         # análise exploratória do small
+    ├── informed_search.ipynb      # Greedy e A*
+    ├── local_search.ipynb         # Hill-Climbing
+    └── csp.ipynb                  # CSP
 ```
 
-**Descrição dos ficheiros principais:**
+### Módulos (`src/`)
 
-- `Proj01.ipynb` — apresentação do projeto, definição do problema, resumo da EDA e abordagem proposta.
-- `EDA.ipynb` — análise exploratória do dataset `small`.
-- `data/` — dados disponibilizados pelo docente.
-- `README.md` — documentação e instruções de execução do projeto.
+- **`model.py`** — descreve o problema e funciona como "juiz" para todos os algoritmos: carrega os CSV (`Problem.from_csv`), aplica as regras de cada paragem (`apply_stop`) e verifica um plano completo (`check_solution`), devolvendo se é válido e os km.
+- **`informed.py`** — `greedy_search` (heurísticas H1: operações que faltam; H2: locais que faltam visitar) e `a_star_search` (f = g + h, com heurísticas admissíveis em km).
+- **`local_search.py`** — `hill_climbing`, que parte da solução do Greedy e usa três tipos de vizinhos (trocar, mover e passar uma encomenda para o outro veículo).
+- **`csp.py`** — `resolver_csp`: variáveis (recolha de cada item e entrega de cada encomenda), domínios (veículo e nº da viagem), restrições, AC-3, forward checking e backtracking, com a heurística de urgência e a restrição soft de menos km.
 
-A estrutura será expandida nas próximas fases para incluir os módulos de implementação dos algoritmos.
+Uma solução é um dicionário `{veículo: [(operação, item), ...]}`, com as operações `pickup`, `unload`, `load` e `deliver`.
 
-## 5. Tecnologias Utilizadas
-
-| Tecnologia | Finalidade |
-|---|---|
-| Python | Desenvolvimento e modelação do problema |
-| Jupyter Notebook | Execução e documentação |
-| Pandas | Manipulação e análise dos dados |
-| NumPy | Operações numéricas |
-| Matplotlib | Visualização gráfica |
-| Git e GitHub | Controlo de versões e colaboração |
-
-## 6. Como Executar o Projeto
+## 5. Como Executar
 
 ### Requisitos
 
-É necessário ter o Python 3 instalado.
-
-### Instalação das dependências
-
-No terminal, dentro da pasta do projeto, executar:
+- Python 3
+- Bibliotecas: pandas, numpy, matplotlib e Jupyter
 
 ```bash
 python3 -m pip install pandas numpy matplotlib notebook
@@ -141,65 +100,53 @@ python3 -m pip install pandas numpy matplotlib notebook
 
 ### Executar os notebooks
 
-Iniciar o Jupyter Notebook:
+Na pasta principal do projeto:
 
 ```bash
 jupyter notebook
 ```
 
-Após iniciar o Jupyter, abrir um dos seguintes ficheiros:
+Abrir os notebooks da pasta `notebooks/` e escolher **Kernel → Restart & Run All**. Os notebooks encontram sozinhos a pasta do projeto (podem ser abertos a partir da raiz ou da pasta `notebooks/`).
 
-- `main.ipynb` — apresentação geral e documentação do projeto.
-- `01_eda_tiny.ipynb` — análise exploratória dos dados.
+Ordem sugerida: `02_eda_tiny` → `informed_search` → `local_search` → `csp` → `01_Project01_G05`.
 
-Para executar a EDA, selecionar **Kernel → Restart & Run All**.
+### Usar os módulos em Python
 
-**Nota:** os notebooks devem ser executados a partir da pasta principal do projeto, mantendo os CSV em `data/small/`.
+```python
+from src.model import Problem, check_solution, print_solution
+from src.informed import greedy_search, heuristica2
+from src.local_search import hill_climbing
 
-## 7. Metodologia e Abordagem Proposta
+problem = Problem.from_csv("data_tiny")
+solucao, nos = greedy_search(problem, heuristica=heuristica2)
+melhor, historico, avaliacoes = hill_climbing(problem, solucao)
+print_solution(problem, melhor)
+```
 
-O desenvolvimento será realizado em diferentes fases.
+## 6. Resultados
 
-### Fase 1 — Análise Exploratória dos Dados
+Distância (km) das soluções encontradas. Todas as soluções foram confirmadas com o `check_solution`.
 
-Exploração do dataset, validação da integridade dos dados e identificação das principais restrições.
+| Algoritmo | tiny | small |
+|---|---:|---:|
+| Greedy H1 | 798,54 | 1070,60 |
+| Greedy H2 | 802,24 | 1009,19 |
+| A\* H1 / H2 (500 expansões) | sem solução | sem solução |
+| Hill-Climbing (a partir do Greedy H1) | 708,96 | 852,38 |
+| Hill-Climbing (a partir do Greedy H2) | **636,31** | **832,41** |
+| CSP | 700,22 | 891,19 |
 
-### Fase 2 — Modelação do Problema
+- **Greedy:** encontra sempre uma solução válida, em segundos, mas não garante a melhor.
+- **A\*:** está implementado corretamente, mas não chega ao fim. O estado inclui horas, cada estado gera dezenas de sucessores e a pesquisa espalha-se em largura (ver `informed_search.ipynb`, secção 8).
+- **Hill-Climbing:** dá as melhores soluções, melhorando o Greedy entre 11% e 21%.
+- **CSP:** encontra uma solução válida sem precisar de solução inicial, com menos km do que o Greedy.
 
-Definição das estruturas `Problem`, `Request`, `Vehicle` e `State`, juntamente com mecanismos de validação de rotas e cálculo dos respetivos custos.
+A análise completa está no notebook `01_Project01_G05.ipynb`.
 
-### Fase 3 — Pesquisa Informada
+## 7. Tecnologias Utilizadas
 
-Implementação dos algoritmos Greedy Best-First Search e A*, utilizando heurísticas para orientar a pesquisa.
-
-### Fase 4 — Pesquisa Local
-
-Implementação de Hill-Climbing para melhorar uma solução inicialmente obtida pelo Greedy.
-
-### Fase 5 — Satisfação de Restrições
-
-Formulação do problema como CSP, através da definição de variáveis, domínios e restrições.
-
-### Fase 6 — Comparação de Resultados
-
-Avaliação das diferentes abordagens relativamente à viabilidade das soluções, aos custos das rotas e ao desempenho computacional.
-
-## 8. Estado Atual do Projeto
-
-**Entrega Preliminar**
-
-Nesta fase foram realizadas as seguintes tarefas:
-
-- [x] Estudo e compreensão do enunciado.
-- [x] Organização inicial do repositório.
-- [x] Análise exploratória do dataset `small`.
-- [x] Verificação da qualidade e integridade dos dados.
-- [x] Identificação das principais restrições do problema.
-- [x] Definição da abordagem proposta.
-- [x] Documentação inicial do projeto.
-
-**Próximas etapas:** modelação do problema, implementação dos algoritmos, realização de testes e comparação dos resultados.
-
----
-
-*Instituto Politécnico do Cávado e do Ave — Inteligência Artificial — 2026/2027*
+| Tecnologia | Finalidade |
+|---|---|
+| Python | Modelação do problema e algoritmos |
+| Jupyter Notebook | Execução e documentação |
+| Git e GitHub | Controlo de versões e colaboração |
