@@ -1,26 +1,15 @@
 """
-informed.py  --  Pesquisa informada: Greedy Best-First Search e A*.
+informed.py — pesquisa informada: Greedy Best-First Search e A*.
 
-GREEDY (primeira parte do ficheiro)
-  Parte do estado inicial (veículos no armazém, nada feito) e escolhe sempre o
-  estado que PARECE mais perto do fim, segundo uma heurística. Pára na primeira
-  solução completa que encontra (não garante a melhor).
-  Peças:
-    - heurísticas   : estimam o que ainda falta fazer (H1 e H2);
-    - sucessores    : movimentos possíveis a partir de um estado;
-    - estado_viavel : deita fora estados que já não têm hipótese (becos sem saída);
-    - greedy_search : o algoritmo, com uma fila de prioridade (heapq).
-  Para ser rápido, só considera algumas opções em cada estado (as 3 encomendas
-  mais urgentes, poucos grupos de recolha) e, numa primeira passagem, só
-  movimentos que comecem nas 2 horas seguintes.
-  As regras do problema são verificadas pelo apply_stop do model.py.
+Greedy: expande sempre o estado com menor heurística e devolve a primeira
+solução válida. Para ser rápido, considera apenas algumas opções em cada
+estado e, numa primeira passagem, só movimentos nas 2 horas seguintes.
 
-A* (segunda parte do ficheiro)
-  A* sobre o problema COMPLETO (sem relaxar nada): f = g + h, com g = km feitos
-  e h = estimativa admissível dos km que faltam. Usa sucessores completos
-  (recolhas e descargas item a item), por isso, se chegasse ao fim, a solução
-  seria a ótima. Nos nossos dados o espaço de estados é demasiado grande e não
-  chega ao fim dentro do limite de expansões (ver o notebook).
+A*: expande o estado com menor f = g + h (g = km percorridos, h = estimativa
+admissível dos km restantes), sobre o problema completo. Garante a solução
+ótima se terminar, mas nestes dados não termina dentro do limite de expansões.
+
+As regras são verificadas pelo apply_stop e pelo check_solution do model.py.
 """
 
 import heapq
@@ -38,14 +27,12 @@ from src.model import (
 # Heurísticas
 # ---------------------------------------------------------------------------
 def heuristica1(problem, estado):
-    """H1: número de operações que ainda faltam.
-    Cada item faz 4 operações: recolher, descarregar, carregar e entregar."""
+    """H1: número de operações que faltam (4 por item)."""
     return sum(DELIVERED - fase for fase in estado.status.values())
 
 
 def heuristica2(problem, estado):
-    """H2: primeiro, quantos locais ainda faltam visitar (produtores e clientes);
-    em caso de empate, os km desses locais ao armazém; por fim, a H1."""
+    """H2: locais por visitar; em empate, km desses locais ao armazém e depois a H1."""
     armazem = problem.warehouse
     produtores = {r.pickup_location for r in problem.requests
                   if estado.status[r.id] == NEW}
@@ -60,12 +47,12 @@ def heuristica2(problem, estado):
 # Estados
 # ---------------------------------------------------------------------------
 def terminou(problem, estado):
-    """O trabalho acabou quando todos os itens estão entregues."""
+    """Objetivo: todos os itens entregues."""
     return all(fase == DELIVERED for fase in estado.status.values())
 
 
 def chave_estado(problem, estado):
-    """'Impressão digital' do estado, para não explorar duas vezes o mesmo."""
+    """Chave que identifica o estado (para detetar estados repetidos)."""
     itens = tuple((i, estado.status[i], estado.owner[i],
                    estado.stored_at[i] if estado.status[i] == STORED else None,
                    estado.ready_at[i] if estado.status[i] == STORED else None)
@@ -84,7 +71,7 @@ def chave_estado(problem, estado):
 
 
 def chegada_mais_cedo(problem, estado, veiculo, operacao, local):
-    """Hora mais cedo a que o veículo pode estar no local para esta operação.
+    """Hora mais cedo de chegada do veículo ao local.
     Se a última paragem foi a mesma operação no mesmo local, junta-se a ela."""
     ultima = estado.stops[veiculo][-1] if estado.stops[veiculo] else None
     if ultima is not None and ultima.action == operacao and ultima.place == local:
@@ -93,11 +80,11 @@ def chegada_mais_cedo(problem, estado, veiculo, operacao, local):
 
 
 # ---------------------------------------------------------------------------
-# Sucessores (movimentos possíveis)
+# Sucessores
 # ---------------------------------------------------------------------------
 def grupos_recolha(problem, estado, veiculo):
-    """Grupos de itens do mesmo produtor que se podem recolher juntos
-    (cabem no veículo e as janelas de recolha têm uma hora em comum)."""
+    """Grupos de itens do mesmo produtor que cabem no veículo e têm
+    janelas de recolha compatíveis."""
     livre = problem.vehicle[veiculo].capacity_kg - estado.load[veiculo]
 
     por_produtor = {}
@@ -111,9 +98,9 @@ def grupos_recolha(problem, estado, veiculo):
             chegada = chegada_mais_cedo(problem, estado, veiculo, PICKUP, local)
         except KeyError:
             continue
-        itens.sort(key=lambda r: (r.pickup_end, r.id))     # os que fecham primeiro
+        itens.sort(key=lambda r: (r.pickup_end, r.id))     # janelas que fecham primeiro
 
-        # Pontos de partida: os 3 que fecham primeiro e o último (para ser rápido)
+        # Sementes: os 3 primeiros e o último (limita o número de grupos)
         for inicial in itens[:3] + itens[-1:]:
             inicio = max(chegada, inicial.pickup_start)
             if inicio > inicial.pickup_end:                # já fechou
@@ -135,19 +122,18 @@ def grupos_recolha(problem, estado, veiculo):
 
 
 def sucessores(problem, estado):
-    """Gera (novo estado, veículo, operação, itens) para cada movimento válido.
-    O estado recebido nunca é alterado: cada movimento trabalha numa cópia."""
+    """Gera (novo estado, veículo, operação, itens) para cada movimento válido."""
     for veiculo in problem.vehicles:
         v = veiculo.id
         movimentos = []
 
-        # 1) Descarregar no armazém tudo o que o veículo leva
+        # 1) Descarregar tudo no armazém
         recolhidos = [i for i in estado.status
                       if estado.status[i] == PICKED and estado.owner[i] == v]
         if recolhidos:
             movimentos.append((UNLOAD, recolhidos))
 
-        # 2) Carregar e entregar encomendas (só as 3 mais urgentes de cada)
+        # 2) Carregar e entregar (as 3 encomendas mais urgentes)
         no_armazem = [ids for ids in problem.orders.values()
                       if all(estado.status[i] == STORED for i in ids)]
         no_veiculo = [ids for ids in problem.orders.values()
@@ -160,11 +146,11 @@ def sucessores(problem, estado):
         for ids in no_veiculo[:3]:
             movimentos.append((DELIVER, ids))
 
-        # 3) Recolher um grupo de itens num produtor
+        # 3) Recolher um grupo num produtor
         for ids in grupos_recolha(problem, estado, v):
             movimentos.append((PICKUP, ids))
 
-        # Só ficam os movimentos que cumprem as regras (apply_stop)
+        # Mantêm-se apenas os movimentos válidos
         for operacao, ids in movimentos:
             novo = estado.copy()
             if apply_stop(problem, novo, v, operacao, ids) is None:
@@ -172,11 +158,10 @@ def sucessores(problem, estado):
 
 
 def estado_viavel(problem, estado):
-    """Diz se o estado ainda pode levar a uma solução (cenário otimista).
-    Deita fora os 'becos sem saída': itens que já não se recolhem a tempo
-    ou encomendas que já não se entregam dentro da janela."""
+    """Verifica, de forma otimista, se o estado ainda pode levar a uma solução
+    (recolhas e entregas ainda possíveis dentro das janelas)."""
     armazem = problem.warehouse
-    pronto = {}                     # item -> hora mais cedo a que fica pronto no armazém
+    pronto = {}                     # item -> hora mais cedo em que fica pronto no armazém
 
     for r in problem.requests:
         fase = estado.status[r.id]
@@ -190,7 +175,7 @@ def estado_viavel(problem, estado):
             if not chegadas:
                 return False
             t = max(min(chegadas), r.pickup_start)
-            if t > r.pickup_end:                            # já não se recolhe a tempo
+            if t > r.pickup_end:                            # recolha impossível
                 return False
             try:
                 pronto[r.id] = t + problem.travel(r.pickup_location, armazem) + problem.handling
@@ -209,13 +194,13 @@ def estado_viavel(problem, estado):
         if all(estado.status[i] == DELIVERED for i in ids):
             continue
         r = problem.request[ids[0]]
-        if all(estado.status[i] == LOADED for i in ids):    # já vai num veículo
+        if all(estado.status[i] == LOADED for i in ids):    # já carregada
             v = estado.owner[ids[0]]
             try:
                 chegada = chegada_mais_cedo(problem, estado, v, DELIVER, r.delivery_location)
             except KeyError:
                 return False
-        else:                                               # ainda tem de passar pelo armazém
+        else:                                               # ainda por carregar
             try:
                 carga = max(pronto[i] for i in ids if i in pronto)
                 chegada = carga + problem.travel(armazem, r.delivery_location)
@@ -226,7 +211,7 @@ def estado_viavel(problem, estado):
         fim = min(problem.request[i].delivery_end for i in ids)
         try:
             if inicio > fim or inicio + problem.travel(r.delivery_location, armazem) > problem.horizon:
-                return False                                # já não se entrega a tempo
+                return False                                # entrega impossível
         except KeyError:
             return False
     return True
@@ -236,23 +221,23 @@ def estado_viavel(problem, estado):
 # Greedy Best-First Search
 # ---------------------------------------------------------------------------
 def _uma_passagem(problem, estado_inicial, heuristica, max_expansoes, janela):
-    """Uma pesquisa Greedy. Se 'janela' não for None, só se expandem movimentos
-    que começam até 'janela' depois do movimento mais cedo possível."""
+    """Uma passagem do Greedy. Com 'janela', só expande movimentos que começam
+    até 'janela' depois do movimento mais cedo."""
     rotas_vazias = {v.id: [] for v in problem.vehicles}
     fila = [(heuristica(problem, estado_inicial), 0, estado_inicial, rotas_vazias)]
     visitados = set()
     expandidos = 0
-    contador = 0                    # desempate: o heapq nunca compara estados
+    contador = 0                    # desempate na fila
 
     while fila and expandidos < max_expansoes:
-        # Tira da fila o estado com menor heurística (o que parece mais perto do fim)
+        # Estado com menor heurística
         _, _, estado, rotas = heapq.heappop(fila)
         chave = chave_estado(problem, estado)
         if chave in visitados:
             continue
         visitados.add(chave)
 
-        # Chegou ao fim? Confirma a solução e devolve-a
+        # Teste de objetivo
         if terminou(problem, estado):
             inicio = estado_inicial.time[problem.vehicles[0].id]
             valida, _, _ = check_solution(problem, rotas, start_time=inicio)
@@ -261,14 +246,14 @@ def _uma_passagem(problem, estado_inicial, heuristica, max_expansoes, janela):
             continue
         expandidos += 1
 
-        # Gera os movimentos e, se houver janela, fica só com os mais próximos no tempo
+        # Sucessores (limitados pela janela, se existir)
         movimentos = list(sucessores(problem, estado))
         if janela is not None and movimentos:
             mais_cedo = min(novo.stops[v][-1].start for novo, v, _, _ in movimentos)
             movimentos = [(novo, v, op, ids) for novo, v, op, ids in movimentos
                           if novo.stops[v][-1].start <= mais_cedo + janela]
 
-        # Põe na fila os estados novos que ainda têm hipótese
+        # Novos estados viáveis para a fila
         for novo, v, operacao, ids in movimentos:
             if not estado_viavel(problem, novo):
                 continue
@@ -286,12 +271,9 @@ def greedy_search(problem, estado_inicial=None, heuristica=heuristica1,
                   janela_horas=2, max_expansoes=5000):
     """
     Greedy Best-First Search.
-    1.ª passagem: só movimentos nas próximas 'janela_horas' (mais rápido).
-    Se não encontrar solução, 2.ª passagem sem esse limite.
-    Cada passagem expande no máximo 'max_expansoes' estados.
-
-    Devolve (rotas, nós expandidos). Rotas = None se não encontrar solução.
-    As rotas estão no formato do model.py: {veículo: [(operação, item), ...]}
+    Faz uma 1.ª passagem com a janela de 'janela_horas' e, se não encontrar
+    solução, uma 2.ª sem janela (cada uma com até 'max_expansoes' expansões).
+    Devolve (rotas, nós expandidos); rotas = None se não houver solução.
     """
     estado = estado_inicial if estado_inicial is not None else problem.initial_state()
     janela = None if janela_horas is None else timedelta(hours=janela_horas)
@@ -306,16 +288,13 @@ def greedy_search(problem, estado_inicial=None, heuristica=heuristica1,
 
 
 # =============================================================================
-# A*  --  f(n) = g(n) + h(n)   (sobre o problema COMPLETO, sem relaxar nada)
-#   g(n): km já percorridos (estado.km)
-#   h(n): estimativa que nunca exagera dos km que ainda faltam
-#         (inclui o regresso dos veículos ao armazém)
-# Reutiliza do Greedy: terminou, chave_estado e estado_viavel.
+# A*: f(n) = g(n) + h(n), sobre o problema completo
+#   g(n): km percorridos; h(n): estimativa admissível dos km restantes
+# Reutiliza terminou, chave_estado e estado_viavel do Greedy.
 # =============================================================================
 
 def distancias_minimas(problem):
-    """Km mínimos entre todos os pares de locais (Floyd-Warshall).
-    Calcula-se uma vez e fica guardado no próprio problema."""
+    """Distâncias mínimas entre todos os locais (Floyd-Warshall), calculadas uma vez."""
     if not hasattr(problem, "_distancias_minimas"):
         locais = sorted({problem.warehouse}
                         | {r.pickup_location for r in problem.requests}
@@ -331,21 +310,21 @@ def distancias_minimas(problem):
 
 
 def astar_h1(problem, estado):
-    """H1 (A*): cada veículo ainda tem de regressar ao armazém."""
+    """H1: soma das distâncias dos veículos ao armazém."""
     d = distancias_minimas(problem)
     return sum(d[estado.place[v], problem.warehouse] for v in estado.place)
 
 
 def astar_h2(problem, estado):
-    """H2 (A*): km mínimos da tarefa por fazer mais cara (recolher num produtor
-    ou entregar uma encomenda), somados ao regresso dos outros veículos."""
+    """H2: custo mínimo da tarefa pendente mais cara (visitar um produtor ou
+    entregar uma encomenda), mais o regresso dos outros veículos."""
     d = distancias_minimas(problem)
     W = problem.warehouse
     regresso = {v: d[estado.place[v], W] for v in estado.place}
     base = sum(regresso.values())                # = astar_h1
     melhor = base
 
-    # Recolhas por fazer: algum veículo vai ao produtor e depois ao armazém
+    # Produtores por visitar: ir ao produtor e voltar ao armazém
     for P in {r.pickup_location for r in problem.requests if estado.status[r.id] == NEW}:
         melhor = max(melhor, min(base - regresso[v] + d[estado.place[v], P] + d[P, W]
                                  for v in estado.place))
@@ -356,10 +335,10 @@ def astar_h2(problem, estado):
         if estado.status[primeiro] == DELIVERED:
             continue
         C = problem.request[primeiro].delivery_location
-        if estado.status[primeiro] == LOADED:    # o veículo que a leva vai ao cliente
+        if estado.status[primeiro] == LOADED:    # já carregada: ir ao cliente
             v = estado.owner[primeiro]
             melhor = max(melhor, base - regresso[v] + d[estado.place[v], C] + d[C, W])
-        else:                                    # ainda tem de passar pelo armazém
+        else:                                    # ainda por carregar
             melhor = max(melhor, min(base - regresso[v] + d[estado.place[v], W] + d[W, C] + d[C, W]
                                      for v in estado.place))
     return melhor
@@ -367,19 +346,14 @@ def astar_h2(problem, estado):
 
 def astar_sucessores(problem, estado):
     """
-    Gera TODOS os movimentos elementares possíveis para o A*.
-
-    As recolhas e as descargas são geradas item a item. É intencional: assim
-    nenhuma escolha "gulosa" de grupos esconde combinações válidas. Repetir a
-    mesma operação no mesmo local junta-a à paragem anterior (apply_stop).
-    O apply_stop trata da capacidade, das janelas e das 24 h no armazém.
-
-    Carregar e entregar é sempre a encomenda completa, como exige o modelo.
+    Todos os movimentos elementares: recolher ou descarregar um item, carregar
+    ou entregar uma encomenda completa. Operações iguais seguidas no mesmo
+    local juntam-se numa só paragem (apply_stop).
     """
     for veiculo in problem.vehicles:
         v = veiculo.id
 
-        # 1) Recolher: cada item por recolher é uma alternativa
+        # 1) Recolher um item
         for r in problem.requests:
             if estado.status[r.id] != NEW:
                 continue
@@ -387,7 +361,7 @@ def astar_sucessores(problem, estado):
             if apply_stop(problem, novo, v, PICKUP, [r.id]) is None:
                 yield novo
 
-        # 2) Descarregar item a item (pode convir deixar alguns no veículo)
+        # 2) Descarregar um item
         recolhidos = [i for i in estado.status
                       if estado.status[i] == PICKED and estado.owner[i] == v]
         for i in recolhidos:
@@ -409,8 +383,7 @@ def astar_sucessores(problem, estado):
 
 
 def rotas_do_estado(problem, estado):
-    """Converte as paragens do estado no formato do model.py:
-    {veículo: [(operação, item), ...]}"""
+    """Converte as paragens do estado em rotas {veículo: [(operação, item), ...]}."""
     rotas = {v.id: [] for v in problem.vehicles}
     for v, paragens in estado.stops.items():
         for paragem in paragens:
@@ -420,7 +393,7 @@ def rotas_do_estado(problem, estado):
 
 
 def _itens_por_fase(estado):
-    """Quantos itens estão em cada fase (para as estatísticas)."""
+    """Número de itens em cada fase."""
     nomes = (("por recolher", NEW), ("recolhidos", PICKED), ("no armazém", STORED),
              ("carregados", LOADED), ("entregues", DELIVERED))
     return {nome: sum(f == fase for f in estado.status.values()) for nome, fase in nomes}
@@ -429,20 +402,13 @@ def _itens_por_fase(estado):
 def a_star_search(problem, estado_inicial=None, heuristica=astar_h2,
                   max_expansoes=20000, max_segundos=None, estatisticas=False):
     """
-    A* sobre o problema original, sem retirar restrições.
+    A* sobre o problema completo: f = g + h (g = km, h = heurística admissível).
+    O objetivo é testado quando o estado sai da fila, o que garante o ótimo.
+    Pára ao encontrar a solução ou ao atingir 'max_expansoes' / 'max_segundos'.
 
-    g(n): km já percorridos.
-    h(n): limite inferior dos km que ainda faltam (heurística admissível).
-    O teste de fim é feito quando o estado SAI da fila (garante o ótimo) e a
-    solução só é devolvida depois de passar o check_solution().
-
-    Pára quando encontra a solução, quando atinge 'max_expansoes' ou quando
-    passam 'max_segundos' (se for dado).
-
-    Devolve (rotas, nós expandidos). Rotas = None se não encontrar solução.
-    Com estatisticas=True devolve (rotas, nós expandidos, info), em que info
-    mostra o tamanho da pesquisa: estados gerados, repetidos, ainda na fila,
-    e em que fase estão os itens do estado mais avançado que foi explorado.
+    Devolve (rotas, nós expandidos); rotas = None se não houver solução.
+    Com estatisticas=True devolve também um dicionário com o tamanho da
+    pesquisa (gerados, repetidos, fila) e o estado mais avançado.
     """
     relogio = time.perf_counter()
     inicio = estado_inicial if estado_inicial is not None else problem.initial_state()
@@ -450,19 +416,18 @@ def a_star_search(problem, estado_inicial=None, heuristica=astar_h2,
 
     def prioridade(estado):
         if terminou(problem, estado):
-            # Estado final: só falta o regresso ao armazém (custo real)
+            # Estado final: h = regresso ao armazém
             h = sum(distancias_minimas(problem)[estado.place[v], W] for v in estado.place)
         else:
             h = heuristica(problem, estado)
         return estado.km + h
 
     def progresso(estado):
-        """Para escolher o estado mais avançado: mais itens entregues,
-        depois mais operações feitas e, em empate, menos km."""
+        """Ordem de progresso: itens entregues, operações feitas e menos km."""
         return (sum(f == DELIVERED for f in estado.status.values()),
                 sum(estado.status.values()), -estado.km)
 
-    contador = 0                                # desempate: o heapq nunca compara estados
+    contador = 0                                # desempate na fila
     fila = [(prioridade(inicio), contador, inicio)]
     best_g = {chave_estado(problem, inicio): inicio.km}   # menor custo conhecido por estado
     expandidos, gerados, repetidos = 0, 1, 0
@@ -480,7 +445,7 @@ def a_star_search(problem, estado_inicial=None, heuristica=astar_h2,
 
         _, _, estado = heapq.heappop(fila)
 
-        # Ignora entradas antigas: já há um caminho mais barato para este estado
+        # Ignorar entradas desatualizadas
         chave = chave_estado(problem, estado)
         if estado.km > best_g.get(chave, float("inf")) + 1e-9:
             continue
@@ -488,7 +453,7 @@ def a_star_search(problem, estado_inicial=None, heuristica=astar_h2,
         if progresso(estado) > progresso(mais_avancado):
             mais_avancado = estado
 
-        # Teste de fim quando o estado SAI da fila
+        # Teste de objetivo à saída da fila
         if terminou(problem, estado):
             rotas = rotas_do_estado(problem, estado)
             valida, _, _ = check_solution(problem, rotas,
@@ -502,8 +467,7 @@ def a_star_search(problem, estado_inicial=None, heuristica=astar_h2,
         expandidos += 1
 
         for novo in astar_sucessores(problem, estado):
-            # Poda otimista: só elimina estados que já não podem cumprir
-            # uma janela ou o horizonte (não estraga o ótimo)
+            # Poda otimista (não elimina soluções válidas)
             if not estado_viavel(problem, novo):
                 continue
 

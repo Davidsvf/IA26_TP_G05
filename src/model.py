@@ -1,31 +1,16 @@
 """
-model.py  --  Modelo do problema: dados, regras e verificação de soluções.
+model.py — modelo do problema.
 
-Ideia: este ficheiro não decide nada. Descreve o problema, diz se um plano
-cumpre as regras e quanto custa. Os algoritmos (Greedy, A*, Hill-Climbing,
-CSP) usam-no como "juiz".
+Lê os dados, aplica as regras de cada paragem e verifica soluções completas.
+É usado por todos os algoritmos (Greedy, A*, Hill-Climbing e CSP) para validar
+e avaliar as rotas.
 
-Peças:
-  - Vehicle, Request, Stop : fichas simples (veículo, item, paragem feita);
-  - Problem                : tudo o que NÃO muda (itens, veículos, distâncias, regras);
-  - State                  : "fotografia" do que já aconteceu;
-  - apply_stop             : as regras de uma paragem (pode fazer-se? como fica?);
-  - check_solution         : verifica um plano completo e devolve os km.
+Uma solução é um dicionário {veículo: [(operação, item), ...]}.
+Cada item passa por: pickup -> unload -> load -> deliver.
 
-Uma solução é um dicionário  {id_do_veículo: [(operação, id_do_item), ...]}
-Cada item faz 4 operações, sempre por esta ordem:
-    pickup  -> recolher no produtor
-    unload  -> descarregar no armazém
-    load    -> carregar no armazém (para ir ao cliente)
-    deliver -> entregar ao cliente
-
-Como se usa:
+Exemplo:
     problem = Problem.from_csv("data_tiny")
     valida, km, mensagem = check_solution(problem, solucao)
-    custo = solution_cost(problem, solucao)        # km, ou infinito se inválida
-
-Nota: os nomes das classes, campos e funções ficam em inglês porque são usados
-pelos outros ficheiros (informed.py, local_search.py).
 """
 
 from copy import deepcopy
@@ -39,43 +24,39 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
-# As 4 operações de cada item (e o regresso final ao armazém)
+# Operações de cada item e regresso final ao armazém
 PICKUP, UNLOAD, LOAD, DELIVER = "pickup", "unload", "load", "deliver"
 OPERATIONS = (PICKUP, UNLOAD, LOAD, DELIVER)
 RETURN = "return"
 
-# Fase em que está cada item:
-#   NEW = no produtor, PICKED = no veículo (vindo do produtor),
-#   STORED = no armazém, LOADED = no veículo (a caminho do cliente),
-#   DELIVERED = entregue
+# Fases de um item: no produtor, recolhido, no armazém, carregado, entregue
 NEW, PICKED, STORED, LOADED, DELIVERED = range(5)
 
-# Fase em que o item tem de estar para se poder fazer cada operação
+# Fase necessária para cada operação
 REQUIRED_STATUS = {PICKUP: NEW, UNLOAD: PICKED, LOAD: STORED, DELIVER: LOADED}
 
-# Tipos de recusa de uma paragem:
-#   WAIT   = "ainda não" (falta outro veículo fazer algo, ex.: descarregar)
-#   BROKEN = "não pode" (viola uma regra)
+# Motivos de recusa: WAIT = ainda não é possível (depende do outro veículo);
+# BROKEN = viola uma regra
 WAIT, BROKEN = "wait", "rule"
 
 
 # ---------------------------------------------------------------------------
-# Fichas simples
+# Estruturas de dados
 # ---------------------------------------------------------------------------
 @dataclass
 class Vehicle:
-    """Um veículo: o seu número e quantos kg aguenta."""
+    """Veículo e respetiva capacidade (kg)."""
     id: int
     capacity_kg: float
 
 
 @dataclass
 class Request:
-    """Um item de uma encomenda: o que levar, de onde, para onde e quando."""
+    """Item de uma encomenda: origem, destino, peso e janelas de tempo."""
     id: int
     order_id: int               # encomenda a que pertence
-    pickup_location: int        # produtor (onde se recolhe)
-    delivery_location: int      # cliente (onde se entrega)
+    pickup_location: int        # produtor
+    delivery_location: int      # local de entrega
     weight_kg: float
     pickup_start: datetime      # janela de recolha
     pickup_end: datetime
@@ -85,18 +66,18 @@ class Request:
 
 @dataclass
 class Stop:
-    """Uma paragem já feita por um veículo (serve para registo e impressão)."""
+    """Paragem realizada por um veículo."""
     action: str
     place: int
-    arrival: datetime       # chegada ao local
-    start: datetime         # início do serviço (no "return": hora de saída do último local)
+    arrival: datetime       # hora de chegada
+    start: datetime         # início do serviço (no regresso: hora de partida)
     finish: datetime        # fim do serviço
     items: tuple
-    km: float               # km percorridos para chegar a esta paragem
+    km: float               # km até esta paragem
 
 
 # ---------------------------------------------------------------------------
-# Problem: tudo o que NÃO muda durante o planeamento
+# Problem: dados fixos da instância
 # ---------------------------------------------------------------------------
 class Problem:
 
@@ -108,18 +89,18 @@ class Problem:
         self.minutes = minutes          # (origem, destino) -> minutos
         self.warehouse = warehouse      # local do armazém
         self.rules = rules or {}        # regras do rules.csv
-        self.names = names or {}        # local -> nome (para imprimir)
+        self.names = names or {}        # local -> nome
 
-        # Acesso rápido por número
+        # Acesso direto por id
         self.request = {item.id: item for item in self.requests}
         self.vehicle = {veiculo.id: veiculo for veiculo in self.vehicles}
 
-        # Encomenda -> itens que a compõem
+        # Itens de cada encomenda
         self.orders = {}
         for item in self.requests:
             self.orders.setdefault(item.order_id, []).append(item.id)
 
-        # Tempos das regras
+        # Tempos definidos no rules.csv
         def minutos(chave, omissao):
             return timedelta(minutes=float(self.rules.get(chave, omissao)))
 
@@ -127,7 +108,7 @@ class Problem:
         self.handling = minutos("warehouse_handling_min", 15)    # no armazém
         self.max_dwell = timedelta(hours=float(self.rules.get("max_warehouse_dwell_h", 24)))
 
-        # Início e fim (horizonte) do planeamento
+        # Início e fim do horizonte de planeamento
         if "start_date" in self.rules:
             self.start = datetime.fromisoformat(self.rules["start_date"])
         else:
@@ -143,16 +124,15 @@ class Problem:
 
     # --- Consultas ----------------------------------------------------------
     def distance(self, origem, destino):
-        """Km entre dois locais (0 se for o mesmo)."""
+        """Distância em km entre dois locais."""
         return 0.0 if origem == destino else self.km[origem, destino]
 
     def travel(self, origem, destino):
-        """Tempo de viagem entre dois locais (0 se for o mesmo)."""
+        """Tempo de viagem entre dois locais."""
         return timedelta(minutes=0 if origem == destino else self.minutes[origem, destino])
 
     def place_of(self, operacao, item):
-        """Onde se faz cada operação: recolher no produtor, entregar no
-        cliente, descarregar e carregar no armazém."""
+        """Local onde se realiza a operação sobre o item."""
         if operacao == PICKUP:
             return item.pickup_location
         if operacao == DELIVER:
@@ -160,12 +140,11 @@ class Problem:
         return self.warehouse
 
     def name(self, local):
-        """Nome de um local (para imprimir)."""
+        """Nome do local."""
         return self.names.get(local, f"local {local}")
 
     def validate(self):
-        """Verificações simples aos dados. Lista vazia = nada de errado detetado
-        (não garante que exista solução)."""
+        """Verificações básicas aos dados. Devolve a lista de problemas encontrados."""
         problemas = []
         maior = max(veiculo.capacity_kg for veiculo in self.vehicles)
 
@@ -186,20 +165,19 @@ class Problem:
         return problemas
 
     def initial_state(self, start_time=None):
-        """Estado inicial: veículos vazios no armazém e todos os itens nos produtores."""
+        """Estado inicial: veículos vazios no armazém e itens por recolher."""
         return State(self, start_time or self.start)
 
     # --- Leitura dos CSV ----------------------------------------------------
     @classmethod
     def from_csv(cls, folder):
-        """Lê os CSV de uma pasta (ex.: "data_tiny") e cria o problema."""
+        """Cria o problema a partir dos CSV de uma pasta (ex.: "data_tiny")."""
         pasta = Path(folder)
         if not pasta.is_dir():
             raise FileNotFoundError(f"Pasta não encontrada: {pasta}")
         tabelas = {f.stem: pd.read_csv(f) for f in sorted(pasta.glob("*.csv"))}
 
-        # Cada local (produtor, cliente, armazém) tem um location_id, que é o
-        # número usado na matriz de distâncias
+        # Converte (tipo, id) no location_id usado na matriz de distâncias
         locais = tabelas["locations"]
         local_de = {(linha.location_type, int(linha.ref_id)): int(linha.location_id)
                     for linha in locais.itertuples()}
@@ -251,7 +229,7 @@ class Problem:
 
 
 # ---------------------------------------------------------------------------
-# State: a "fotografia" do que já aconteceu
+# State: situação atual do planeamento
 # ---------------------------------------------------------------------------
 class State:
 
@@ -261,12 +239,12 @@ class State:
 
         # Por veículo
         self.time = {v: start_time for v in veiculos}            # hora a que fica livre
-        self.place = {v: problem.warehouse for v in veiculos}    # onde está
-        self.load = {v: 0.0 for v in veiculos}                   # kg a bordo
-        self.stops = {v: [] for v in veiculos}                   # paragens já feitas
+        self.place = {v: problem.warehouse for v in veiculos}    # local atual
+        self.load = {v: 0.0 for v in veiculos}                   # carga (kg)
+        self.stops = {v: [] for v in veiculos}                   # paragens realizadas
 
         # Por item
-        self.status = {i: NEW for i in itens}                    # fase (NEW ... DELIVERED)
+        self.status = {i: NEW for i in itens}                    # fase do item
         self.owner = {i: None for i in itens}                    # veículo que o leva
         self.stored_at = {i: None for i in itens}                # chegada ao armazém
         self.ready_at = {i: None for i in itens}                 # fim da descarga
@@ -274,15 +252,15 @@ class State:
         self.km = 0.0                                            # km percorridos
 
     def copy(self):
-        """Cópia completa (para experimentar um movimento sem estragar o original)."""
+        """Cópia independente do estado."""
         return deepcopy(self)
 
 
 # ---------------------------------------------------------------------------
-# As regras: o que acontece quando um veículo faz uma paragem
+# Regras de uma paragem
 # ---------------------------------------------------------------------------
 def wrong_status(estado, veiculo, operacao, ids):
-    """Devolve um motivo se algum item ainda não está pronto para esta operação."""
+    """Devolve o motivo se algum item não estiver pronto para a operação."""
     for i in ids:
         if estado.status[i] != REQUIRED_STATUS[operacao]:
             return "item ainda não está na fase certa"
@@ -292,26 +270,26 @@ def wrong_status(estado, veiculo, operacao, ids):
 
 
 def _tentar_paragem(problem, estado, veiculo, operacao, ids, juntar):
-    """Tenta fazer uma paragem. Se correr bem, altera o estado e devolve None.
-    Se não, devolve (tipo, motivo) e NÃO altera nada."""
+    """Tenta aplicar uma paragem. Se for válida, atualiza o estado e devolve None;
+    caso contrário, devolve (tipo, motivo) sem alterar o estado."""
 
-    # 1) Os itens estão na fase certa?
+    # 1) Fase dos itens
     motivo = wrong_status(estado, veiculo, operacao, ids)
     if motivo:
         return WAIT, motivo
 
-    # 2) Todos os itens da paragem têm de ser do mesmo local
+    # 2) Todos os itens no mesmo local
     local = problem.place_of(operacao, problem.request[ids[0]])
     if any(problem.place_of(operacao, problem.request[i]) != local for i in ids):
         return BROKEN, "itens de locais diferentes na mesma paragem"
 
-    # 3) Carregar/entregar: as encomendas vão sempre inteiras
+    # 3) Carga e entrega de encomendas completas
     if operacao in (LOAD, DELIVER):
         for encomenda in {problem.request[i].order_id for i in ids}:
             if not set(problem.orders[encomenda]) <= set(ids):
                 return BROKEN, f"encomenda {encomenda} dividida"
 
-    # 4) Chegada. Operações iguais seguidas no mesmo local contam como UMA paragem
+    # 4) Chegada (operações iguais seguidas no mesmo local formam uma só paragem)
     anterior = estado.stops[veiculo][-1] if estado.stops[veiculo] else None
     juntar = (juntar and anterior is not None
               and anterior.action == operacao and anterior.place == local)
@@ -335,32 +313,32 @@ def _tentar_paragem(problem, estado, veiculo, operacao, ids, juntar):
         fecha = min(item.delivery_end for item in itens)
 
     if operacao in (PICKUP, DELIVER):
-        # espera pela abertura da janela, mas não pode chegar depois do fecho
+        # pode esperar pela abertura, mas não começar depois do fecho
         if max(chegada, abre) > fecha:
             return BROKEN, "janela de tempo ultrapassada"
         inicio = max(chegada, abre)
     elif operacao == LOAD:
-        # só se carrega depois de tudo estar descarregado...
+        # a carga começa depois de a descarga terminar
         inicio = max([chegada] + [estado.ready_at[i] for i in membros])
-        # ...e nenhum item pode estar mais de 24h no armazém
+        # e respeita o máximo de 24 h no armazém
         if any(inicio - estado.stored_at[i] > problem.max_dwell for i in membros):
             return BROKEN, "mais de 24h no armazém"
     else:                                       # descarregar
         inicio = chegada
 
-    # 6) Fim do serviço, e ainda tem de dar tempo para voltar ao armazém
+    # 6) Fim do serviço e regresso dentro do horizonte
     duracao = problem.service if operacao in (PICKUP, DELIVER) else problem.handling
     fim = inicio + duracao
     if fim + regresso > problem.horizon:
         return BROKEN, "fora do horizonte de planeamento"
 
-    # 7) Capacidade: recolher e carregar somam peso; descarregar e entregar tiram
+    # 7) Capacidade do veículo
     peso = sum(problem.request[i].weight_kg for i in ids)
     nova_carga = estado.load[veiculo] + (peso if operacao in (PICKUP, LOAD) else -peso)
     if not -1e-6 <= nova_carga <= problem.vehicle[veiculo].capacity_kg + 1e-6:
         return BROKEN, "capacidade do veículo excedida"
 
-    # 8) Tudo certo: atualizar o estado
+    # 8) Atualizar o estado
     estado.time[veiculo] = fim
     estado.place[veiculo] = local
     estado.load[veiculo] = max(0.0, nova_carga)
@@ -378,25 +356,24 @@ def _tentar_paragem(problem, estado, veiculo, operacao, ids, juntar):
             estado.status[i], estado.owner[i] = PICKED, veiculo
         elif operacao == UNLOAD:
             estado.status[i], estado.owner[i] = STORED, None
-            estado.stored_at[i] = chegada          # as 24h contam desde a chegada
+            estado.stored_at[i] = chegada          # início da contagem das 24 h
         elif operacao == LOAD:
             estado.status[i], estado.owner[i] = LOADED, veiculo
         else:
             estado.status[i], estado.owner[i] = DELIVERED, None
     if operacao == UNLOAD:
         for i in membros:
-            estado.ready_at[i] = fim               # pronto quando acaba a descarga
+            estado.ready_at[i] = fim               # disponível após a descarga
     return None
 
 
 def apply_stop(problem, estado, veiculo, operacao, ids):
     """
-    O veículo faz uma paragem (operação sobre os itens 'ids').
-    Tenta juntá-la à paragem anterior (mesmo local e operação); se a junção
-    violar uma regra, faz uma paragem separada.
-    Devolve None se correu bem (e altera o estado), ou (tipo, motivo) se não.
+    Aplica uma paragem do veículo aos itens indicados.
+    Tenta juntá-la à paragem anterior e, se isso violar uma regra, faz uma
+    paragem separada. Devolve None se for válida, ou (tipo, motivo).
     """
-    # Validar os argumentos antes de mexer em qualquer coisa
+    # Validação dos argumentos
     if veiculo not in problem.vehicle:
         return BROKEN, f"veículo desconhecido: {veiculo}"
     if operacao not in OPERATIONS:
@@ -418,10 +395,10 @@ def apply_stop(problem, estado, veiculo, operacao, ids):
 
 
 # ---------------------------------------------------------------------------
-# O "fiscal": verifica uma solução completa
+# Verificação de soluções completas
 # ---------------------------------------------------------------------------
 def _paragens_da_rota(problem, rota):
-    """Junta operações iguais seguidas no mesmo local: [(operação, local, [itens])]"""
+    """Agrupa operações iguais seguidas no mesmo local: [(operação, local, [itens])]."""
     paragens = []
     for operacao, i in rota:
         local = problem.place_of(operacao, problem.request[i])
@@ -434,12 +411,10 @@ def _paragens_da_rota(problem, rota):
 
 def simulate(problem, solution, check_all=True, start_time=None, parcial=False):
     """
-    Simula a solução do início ao fim. Devolve (válida?, estado final, mensagem).
-    Com check_all=True exige que todas as encomendas sejam entregues.
-    Com parcial=True aceita planos incompletos (usado pelo CSP a meio da
-    pesquisa): não exige todas as operações de cada item e, se um item é
-    carregado sem a sua recolha estar no plano, considera que já está no
-    armazém (caso otimista).
+    Simula a solução e devolve (válida?, estado final, mensagem).
+    check_all=True: exige que todas as encomendas sejam entregues.
+    parcial=True: aceita planos incompletos (usado pelo CSP); os itens
+    carregados sem recolha no plano são considerados já no armazém.
     """
     def falha(mensagem, estado=None):
         return False, estado, mensagem
@@ -471,15 +446,14 @@ def simulate(problem, solution, check_all=True, start_time=None, parcial=False):
             if any((operacao, i) not in vistas for operacao in OPERATIONS):
                 return falha(f"Faltam operações no item {i}")
 
-    # 2) Simulação: cada veículo avança enquanto puder; se está à espera de
-    #    outro veículo (ex.: item ainda não chegou ao armazém), passa-se ao seguinte
+    # 2) Simulação: cada veículo avança enquanto pode; se depender do outro
+    #    veículo, passa-se ao seguinte
     estado = problem.initial_state(start_time)
     if not all(problem.start <= t < problem.horizon for t in estado.time.values()):
         return falha("Partida fora do horizonte de planeamento")
 
     if parcial:
-        # Itens carregados cuja recolha ainda não está no plano: já estão no
-        # armazém desde o início, e as 24h ainda não contam para eles
+        # Itens sem recolha no plano: considerados no armazém, sem contar as 24 h
         for i in usados:
             if (LOAD, i) in vistas and (UNLOAD, i) not in vistas:
                 estado.status[i] = STORED
@@ -497,7 +471,7 @@ def simulate(problem, solution, check_all=True, start_time=None, parcial=False):
 
                 if operacao in (PICKUP, UNLOAD):
                     unidades = [[i] for i in ids]        # item a item
-                else:                                    # carregar/entregar: encomendas inteiras
+                else:                                    # carga/entrega por encomenda
                     por_encomenda = {}
                     for i in ids:
                         por_encomenda.setdefault(problem.request[i].order_id, []).append(i)
@@ -515,7 +489,7 @@ def simulate(problem, solution, check_all=True, start_time=None, parcial=False):
     if not parcial and not all(fase in (NEW, DELIVERED) for fase in estado.status.values()):
         return falha("Produtos por entregar", estado)
 
-    # 3) Regresso de todos os veículos ao armazém
+    # 3) Regresso ao armazém
     for v in paragens:
         try:
             km_viagem = problem.distance(estado.place[v], problem.warehouse)
@@ -547,13 +521,13 @@ def check_route(problem, vehicle, route, start_time=None):
 
 
 def solution_cost(problem, solution, start_time=None):
-    """Função de custo: km totais se a solução é válida, infinito se não for."""
+    """Função de custo: km totais, ou infinito se a solução for inválida."""
     valida, km, _ = check_solution(problem, solution, start_time)
     return km if valida else float("inf")
 
 
 def print_solution(problem, solution):
-    """Mostra o plano de cada veículo: hora, operação, local, itens e km."""
+    """Mostra o plano de cada veículo."""
     valida, estado, mensagem = simulate(problem, solution)
     print(mensagem, f"| total: {round(estado.km, 2) if estado else 0} km")
     if not estado:
