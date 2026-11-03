@@ -127,7 +127,7 @@ class CSP:
         return carga <= self.capacidade[valor[0]] + 1e-6
 
     def viagem_seguinte(self, valor, atribuicao):
-        """Quebra de simetria: a viagem k só pode ser usada depois das anteriores."""
+        """A viagem k só pode ser usada depois das anteriores."""
         veiculo, k = valor
         usadas = {w[1] for w in atribuicao.values() if w[0] == veiculo}
         return k <= len(usadas)
