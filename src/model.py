@@ -432,10 +432,14 @@ def _paragens_da_rota(problem, rota):
     return paragens
 
 
-def simulate(problem, solution, check_all=True, start_time=None):
+def simulate(problem, solution, check_all=True, start_time=None, parcial=False):
     """
     Simula a solução do início ao fim. Devolve (válida?, estado final, mensagem).
     Com check_all=True exige que todas as encomendas sejam entregues.
+    Com parcial=True aceita planos incompletos (usado pelo CSP a meio da
+    pesquisa): não exige todas as operações de cada item e, se um item é
+    carregado sem a sua recolha estar no plano, considera que já está no
+    armazém (caso otimista).
     """
     def falha(mensagem, estado=None):
         return False, estado, mensagem
@@ -457,20 +461,30 @@ def simulate(problem, solution, check_all=True, start_time=None):
         paragens[veiculo] = _paragens_da_rota(problem, rota)
 
     usados = {i for _, i in vistas}
-    if check_all and usados != set(problem.request):
-        return falha("Encomendas por entregar")
-    for i in usados:
-        encomenda = problem.request[i].order_id
-        if not set(problem.orders[encomenda]) <= usados:
-            return falha(f"Encomenda {encomenda} incompleta")
-        if any((operacao, i) not in vistas for operacao in OPERATIONS):
-            return falha(f"Faltam operações no item {i}")
+    if not parcial:
+        if check_all and usados != set(problem.request):
+            return falha("Encomendas por entregar")
+        for i in usados:
+            encomenda = problem.request[i].order_id
+            if not set(problem.orders[encomenda]) <= usados:
+                return falha(f"Encomenda {encomenda} incompleta")
+            if any((operacao, i) not in vistas for operacao in OPERATIONS):
+                return falha(f"Faltam operações no item {i}")
 
     # 2) Simulação: cada veículo avança enquanto puder; se está à espera de
     #    outro veículo (ex.: item ainda não chegou ao armazém), passa-se ao seguinte
     estado = problem.initial_state(start_time)
     if not all(problem.start <= t < problem.horizon for t in estado.time.values()):
         return falha("Partida fora do horizonte de planeamento")
+
+    if parcial:
+        # Itens carregados cuja recolha ainda não está no plano: já estão no
+        # armazém desde o início, e as 24h ainda não contam para eles
+        for i in usados:
+            if (LOAD, i) in vistas and (UNLOAD, i) not in vistas:
+                estado.status[i] = STORED
+                estado.ready_at[i] = estado.time[problem.vehicles[0].id]
+                estado.stored_at[i] = problem.horizon
 
     posicao = {v: 0 for v in paragens}          # próxima paragem de cada veículo
     while any(posicao[v] < len(paragens[v]) for v in paragens):
@@ -498,7 +512,7 @@ def simulate(problem, solution, check_all=True, start_time=None):
         if not avancou:
             return falha("Ordem das operações inválida", estado)
 
-    if not all(fase in (NEW, DELIVERED) for fase in estado.status.values()):
+    if not parcial and not all(fase in (NEW, DELIVERED) for fase in estado.status.values()):
         return falha("Produtos por entregar", estado)
 
     # 3) Regresso de todos os veículos ao armazém

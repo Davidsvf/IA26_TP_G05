@@ -300,244 +300,307 @@ def greedy_search(problem, estado_inicial=None, heuristica=heuristica1,
     return None, total
 
 
-# =============================================================================
-# Distâncias mínimas (usadas pelo A* relaxado)
-# =============================================================================
-
-def shortest_km(problem):
-    """Km mínimos entre todos os pares de locais (Floyd-Warshall).
-    Calcula-se uma vez e fica guardado no próprio problema."""
-    if not hasattr(problem, "_shortest_km"):
-        places = sorted({problem.warehouse}
-                        | {r.pickup_location for r in problem.requests}
-                        | {r.delivery_location for r in problem.requests})
-        d = {(a, b): 0.0 if a == b else problem.km.get((a, b), float("inf"))
-             for a in places for b in places}
-        for k in places:
-            for a in places:
-                for b in places:
-                    d[a, b] = min(d[a, b], d[a, k] + d[k, b])
-        problem._shortest_km = d
-    return problem._shortest_km
-
-
-# =============================================================================
-# A* sobre o PROBLEMA RELAXADO  --  encontra a solução ÓTIMA desta versão
-#
-# Relaxação: são retiradas as JANELAS DE TEMPO (recolha e entrega).
-# Mantém-se no problema: horizonte de 2 dias, máximo de 24h no armazém,
-# capacidade dos veículos, produtor -> armazém -> cliente e encomendas inteiras.
-#
-# "Relaxar e verificar": a pesquisa não controla as horas, por isso resolve o
-# problema sem janelas, sem horizonte e sem 24h. No fim, o check_solution
-# confirma se a solução cumpre o horizonte e as 24h. Se cumprir, é também a
-# solução ótima do problema em que só as janelas são relaxadas (repor regras
-# nunca torna possível uma solução mais barata). Se não cumprir, é dado um
-# aviso e essa garantia deixa de existir.
-#
-# Sem janelas, o problema reduz-se a "que veículo visita que locais e por que
-# ordem". Considera-se ainda que:
-#   - num produtor recolhe-se tudo de uma vez;
-#   - no armazém descarrega-se tudo o que o veículo leva;
-#   - as encomendas para o mesmo cliente carregam-se e entregam-se juntas.
-# Sem capacidade isto não piora o ótimo (voltar a um local só acrescenta km).
-# Com capacidade, a solução é a ótima entre as que visitam cada produtor uma
-# vez e servem cada cliente de uma vez (não se divide uma recolha/entrega).
-#
-# Estado (tuplos pequenos, muito mais rápido que o State do model.py):
-#   (posição de cada veículo, fase de cada produtor, fase de cada cliente)
-#   produtor: 0 = por recolher, k = no veículo k, DONE = no armazém
-#   cliente:  0 = por carregar, k = no veículo k, DONE = entregue
-# =============================================================================
-
-from dataclasses import replace
-
+# ---------------------------------------------------------------------------
+# A* PARCIAL — código independente do Greedy acima
+# ---------------------------------------------------------------------------
 from src.model import Problem
 
 
-def relax_problem(problem, keep_capacity=True):
-    """Versão relaxada: as janelas de recolha e de entrega passam a cobrir todo
-    o horizonte. O horizonte e o limite de 24h no armazém mantêm-se.
-    Com keep_capacity=False os veículos ficam também sem limite de carga."""
-    requests = [replace(r, pickup_start=problem.start, pickup_end=problem.horizon,
-                        delivery_start=problem.start, delivery_end=problem.horizon)
-                for r in problem.requests]
-    vehicles = list(problem.vehicles)
-    if not keep_capacity:
-        vehicles = [replace(v, capacity_kg=float("inf")) for v in problem.vehicles]
-    return Problem(requests, vehicles, problem.km, problem.minutes,
-                   problem.warehouse, problem.rules, problem.names)
+def _astar_distancias(problem):
+    """Menores distâncias em km entre os locais usados na encomenda."""
+    locais = ({problem.warehouse}
+              | {r.pickup_location for r in problem.requests}
+              | {r.delivery_location for r in problem.requests})
+
+    distancias = {
+        (origem, destino): (0.0 if origem == destino
+                            else problem.km.get((origem, destino), float("inf")))
+        for origem in locais for destino in locais
+    }
+
+    for intermedio in locais:
+        for origem in locais:
+            for destino in locais:
+                distancias[origem, destino] = min(
+                    distancias[origem, destino],
+                    distancias[origem, intermedio]
+                    + distancias[intermedio, destino]
+                )
+    return distancias
 
 
-def _relaxed_context(problem):
-    """Dados fixos usados pela pesquisa relaxada."""
-    producers = sorted({r.pickup_location for r in problem.requests})
-    groups = {}                                   # cliente -> itens a entregar lá
-    for r in problem.requests:
-        groups.setdefault(r.delivery_location, []).append(r.id)
-    dests = sorted(groups)
-    index = {P: j for j, P in enumerate(producers)}
-    # produtores de que cada cliente precisa (para poder carregar no armazém)
-    need = [tuple(sorted({index[problem.request[i].pickup_location] for i in groups[D]}))
-            for D in dests]
-    # pesos: tudo o que se recolhe num produtor / se entrega num cliente
-    w_prod = [sum(r.weight_kg for r in problem.requests if r.pickup_location == P)
-              for P in producers]
-    w_dest = [sum(problem.request[i].weight_kg for i in groups[D]) for D in dests]
-    return {"d": shortest_km(problem), "W": problem.warehouse,
-            "producers": producers, "dests": dests, "groups": groups,
-            "need": need, "DONE": len(problem.vehicles) + 1,
-            "capacity": [v.capacity_kg for v in problem.vehicles],
-            "w_prod": w_prod, "w_dest": w_dest}
+def _astar_heuristica(problem, estado, distancias):
+    """Estimativa inferior dos km que faltam para concluir a encomenda."""
+    veiculo = problem.vehicles[0].id
+    armazem = problem.warehouse
+    posicao = estado.place[veiculo]
+    estimativa = distancias[posicao, armazem]
+
+    for item in problem.requests:
+        fase = estado.status[item.id]
+        if fase == NEW:
+            km = (distancias[posicao, item.pickup_location]
+                  + distancias[item.pickup_location, armazem]
+                  + distancias[armazem, item.delivery_location]
+                  + distancias[item.delivery_location, armazem])
+        elif fase == PICKED:
+            km = (distancias[posicao, armazem]
+                  + distancias[armazem, item.delivery_location]
+                  + distancias[item.delivery_location, armazem])
+        elif fase == STORED:
+            km = (distancias[armazem, item.delivery_location]
+                  + distancias[item.delivery_location, armazem])
+        elif fase == LOADED:
+            km = (distancias[posicao, item.delivery_location]
+                  + distancias[item.delivery_location, armazem])
+        else:
+            km = 0.0
+        estimativa = max(estimativa, km)
+
+    return estimativa
 
 
-def _relaxed_load(ctx, state, k):
-    """Kg que o veículo k leva neste estado (recolhas + encomendas carregadas)."""
-    code = k + 1
-    return (sum(w for w, s in zip(ctx["w_prod"], state[1]) if s == code)
-            + sum(w for w, s in zip(ctx["w_dest"], state[2]) if s == code))
+def _astar_sucessores(problem, estado):
+    """Gera movimentos para uma única encomenda, respeitando apply_stop."""
+    veiculo = problem.vehicles[0].id
+    movimentos = []
+
+    recolhidos = [i for i in estado.status if estado.status[i] == PICKED]
+    if recolhidos:
+        movimentos.append((UNLOAD, recolhidos))
+
+    for ids in problem.orders.values():
+        if all(estado.status[i] == STORED for i in ids):
+            movimentos.append((LOAD, ids))
+        if all(estado.status[i] == LOADED for i in ids):
+            movimentos.append((DELIVER, ids))
+
+    produtores = {}
+    for item in problem.requests:
+        if estado.status[item.id] == NEW:
+            produtores.setdefault(item.pickup_location, []).append(item.id)
+
+    for ids in produtores.values():
+        movimentos.append((PICKUP, ids))
+        if len(ids) > 1:
+            for i in ids:
+                movimentos.append((PICKUP, [i]))
+
+    for operacao, ids in movimentos:
+        novo = estado.copy()
+        if apply_stop(problem, novo, veiculo, operacao, ids) is None:
+            yield novo
 
 
-def relaxed_h1(ctx, state):
-    """H1: cada veículo ainda tem de regressar ao armazém."""
-    d, W = ctx["d"], ctx["W"]
-    return sum(d[p, W] for p in state[0])
+def _astar_uma_encomenda(problem, encomenda, veiculo, max_expansoes):
+    """A* para uma encomenda com um veículo, sujeito às regras originais."""
+    itens = [problem.request[i] for i in problem.orders[encomenda]]
+    reduzido = Problem(itens, [veiculo], problem.km, problem.minutes,
+                       problem.warehouse, problem.rules, problem.names)
 
+    distancias = _astar_distancias(reduzido)
+    inicial = reduzido.initial_state()
+    fila = [(_astar_heuristica(reduzido, inicial, distancias), 0, 0, inicial)]
+    melhores = {chave_estado(reduzido, inicial): 0.0}
+    contador = 0
+    expandidos = 0
 
-def relaxed_h2(ctx, state):
-    """H2: árvore geradora mínima (MST) que liga o armazém, os veículos e os
-    locais ainda por visitar. Os percursos dos veículos têm de ligar todos
-    esses pontos, por isso nunca são mais curtos que a MST (admissível)."""
-    d, W, DONE = ctx["d"], ctx["W"], ctx["DONE"]
-    pos, prod, deliv = state
-    points = set(pos)
-    points.update(ctx["producers"][j] for j, s in enumerate(prod) if s == 0)
-    points.update(ctx["dests"][t] for t, s in enumerate(deliv) if s != DONE)
-    points.discard(W)
-
-    dist = {b: d[W, b] for b in points}           # algoritmo de Prim a partir do armazém
-    total = 0.0
-    while dist:
-        b = min(dist, key=dist.get)
-        total += dist.pop(b)
-        for c in dist:
-            dist[c] = min(dist[c], d[b, c])
-    return max(total, relaxed_h1(ctx, state))
-
-
-def _relaxed_moves(ctx, state):
-    """Gera (custo em km, novo estado, movimento) para cada veículo.
-    Recolher e carregar só são possíveis se couberem no veículo."""
-    d, W, DONE = ctx["d"], ctx["W"], ctx["DONE"]
-    producers, dests, need = ctx["producers"], ctx["dests"], ctx["need"]
-    pos, prod, deliv = state
-
-    for k in range(len(pos)):
-        here, code = pos[k], k + 1
-        moved = lambda place: pos[:k] + (place,) + pos[k + 1:]
-
-        free = ctx["capacity"][k] - _relaxed_load(ctx, state, k)
-
-        # Recolher tudo num produtor ainda por visitar (se couber)
-        for j, s in enumerate(prod):
-            if s == 0 and ctx["w_prod"][j] <= free + 1e-6:
-                P = producers[j]
-                yield (d[here, P], (moved(P), prod[:j] + (code,) + prod[j + 1:], deliv),
-                       (k, PICKUP, P))
-
-        # Descarregar no armazém tudo o que o veículo leva
-        if code in prod:
-            yield (d[here, W], (moved(W), tuple(DONE if s == code else s for s in prod), deliv),
-                   (k, UNLOAD, W))
-
-        for t, s in enumerate(deliv):
-            # Carregar as encomendas de um cliente (produtos já no armazém e cabem)
-            if (s == 0 and all(prod[j] == DONE for j in need[t])
-                    and ctx["w_dest"][t] <= free + 1e-6):
-                yield (d[here, W], (moved(W), prod, deliv[:t] + (code,) + deliv[t + 1:]),
-                       (k, LOAD, dests[t]))
-            # Entregar no cliente as encomendas que este veículo leva
-            elif s == code:
-                D = dests[t]
-                yield (d[here, D], (moved(D), prod, deliv[:t] + (DONE,) + deliv[t + 1:]),
-                       (k, DELIVER, D))
-
-
-def _relaxed_routes(problem, ctx, state, parent):
-    """Reconstrói o caminho e converte-o no formato do model.py:
-    {veículo: [(operação, item), ...]}"""
-    path = []
-    while parent[state] is not None:
-        state, move = parent[state]
-        path.append(move)
-    path.reverse()
-
-    vids = [v.id for v in problem.vehicles]
-    routes = {v: [] for v in vids}
-    carrying = {v: [] for v in vids}
-    for k, action, place in path:
-        v = vids[k]
-        if action == PICKUP:
-            ids = [r.id for r in problem.requests if r.pickup_location == place]
-            carrying[v] += ids
-        elif action == UNLOAD:
-            ids, carrying[v] = carrying[v], []
-        else:                                     # LOAD ou DELIVER: itens desse cliente
-            ids = ctx["groups"][place]
-        routes[v] += [(action, i) for i in ids]
-    return routes
-
-
-def relaxed_a_star(problem, heuristic=relaxed_h2, max_expansions=None):
-    """
-    A* sobre o problema relaxado (usar com relax_problem(problem)).
-    Respeita a capacidade dos veículos do problema recebido. No fim verifica
-    o horizonte e o limite de 24h com o check_solution (ver comentário acima).
-    Com heurística admissível, devolve a solução de MENOR custo (km) dessa versão.
-    Devolve (rotas, nós expandidos). Rotas = None se não encontrar solução.
-    """
-    ctx = _relaxed_context(problem)
-    DONE = ctx["DONE"]
-
-    def is_final(state):
-        return all(s == DONE for s in state[2])
-
-    def priority(state, g):
-        if is_final(state):                       # custo real: km + regresso ao armazém
-            return g + relaxed_h1(ctx, state)
-        return g + heuristic(ctx, state)
-
-    start = (tuple(ctx["W"] for _ in problem.vehicles),
-             tuple(0 for _ in ctx["producers"]),
-             tuple(0 for _ in ctx["dests"]))
-    best_g = {start: 0.0}                          # menor custo conhecido por estado
-    parent = {start: None}                         # para reconstruir o caminho
-    counter = 0
-    queue = [(priority(start, 0.0), counter, 0.0, start)]
-    expanded = 0
-
-    while queue and (max_expansions is None or expanded < max_expansions):
-        _, _, g, state = heapq.heappop(queue)
-        if g > best_g[state] + 1e-9:               # entrada desatualizada
+    while fila and (max_expansoes is None or expandidos < max_expansoes):
+        _, _, _, atual = heapq.heappop(fila)
+        chave = chave_estado(reduzido, atual)
+        if atual.km > melhores.get(chave, float("inf")) + 1e-9:
             continue
 
-        # Teste de fim quando o estado SAI da fila (garante o ótimo)
-        if is_final(state):
-            routes = _relaxed_routes(problem, ctx, state, parent)
-            # Verifica as regras de tempo que a pesquisa não controla (horizonte, 24h)
-            valid, _, message = check_solution(problem, routes)
-            if not valid:
-                print("Aviso: a melhor rota não cumpre as regras de tempo "
-                      f"({message}); o ótimo deixa de estar garantido.")
-            return routes, expanded
-        expanded += 1
+        if terminou(reduzido, atual):
+            rota = [(p.action, i) for p in atual.stops[veiculo.id] for i in p.items]
+            valida, _, _ = check_solution(reduzido, {veiculo.id: rota})
+            if valida:
+                return rota, expandidos
+            continue
 
-        for cost, new_state, move in _relaxed_moves(ctx, state):
-            new_g = g + cost
-            if new_g < best_g.get(new_state, float("inf")) - 1e-9:
-                best_g[new_state] = new_g
-                parent[new_state] = (state, move)
-                counter += 1
-                heapq.heappush(queue, (priority(new_state, new_g), counter, new_g, new_state))
+        expandidos += 1
+        for novo in _astar_sucessores(reduzido, atual):
+            chave = chave_estado(reduzido, novo)
+            if novo.km >= melhores.get(chave, float("inf")) - 1e-9:
+                continue
+            melhores[chave] = novo.km
+            contador += 1
+            entregues = sum(fase == DELIVERED for fase in novo.status.values())
+            f = novo.km + _astar_heuristica(reduzido, novo, distancias)
+            heapq.heappush(fila, (f, -entregues, contador, novo))
 
-    return None, expanded
+    return None, expandidos
+
+
+def _astar_grupo(problem, encomendas, veiculo, max_expansoes):
+    """A* para várias encomendas transportadas pelo mesmo veículo.
+
+    Ao pesquisar as encomendas juntas, pode intercalar recolhas,
+    descargas, cargas e entregas, partilhando deslocações.
+    """
+    ids = [i for e in encomendas for i in problem.orders[e]]
+    itens = [problem.request[i] for i in ids]
+    reduzido = Problem(itens, [veiculo], problem.km, problem.minutes,
+                       problem.warehouse, problem.rules, problem.names)
+
+    distancias = _astar_distancias(reduzido)
+    inicial = reduzido.initial_state()
+    fila = [(_astar_heuristica(reduzido, inicial, distancias), 0, inicial)]
+    melhores = {chave_estado(reduzido, inicial): 0.0}
+    contador = 0
+    expandidos = 0
+
+    while fila and (max_expansoes is None or expandidos < max_expansoes):
+        _, _, atual = heapq.heappop(fila)
+        chave = chave_estado(reduzido, atual)
+        if atual.km > melhores.get(chave, float("inf")) + 1e-9:
+            continue
+
+        if terminou(reduzido, atual):
+            rota = [(p.action, i) for p in atual.stops[veiculo.id]
+                    for i in p.items]
+            valido, _, _ = check_solution(reduzido, {veiculo.id: rota})
+            if valido:
+                return rota, expandidos
+            continue
+
+        expandidos += 1
+        for novo in _astar_sucessores(reduzido, atual):
+            chave = chave_estado(reduzido, novo)
+            if novo.km >= melhores.get(chave, float("inf")) - 1e-9:
+                continue
+            melhores[chave] = novo.km
+            contador += 1
+            custo_estimado = novo.km + _astar_heuristica(reduzido, novo, distancias)
+            heapq.heappush(fila, (custo_estimado, contador, novo))
+
+    return None, expandidos
+
+
+def a_star_parcial(problem, max_encomendas=8, max_expansoes=80,
+                   largura=20, vizinhos_pares=3, max_validacoes=4000):
+    """A* parcial: encomendas isoladas/pares + combinação em feixe.
+
+    Guarda várias combinações, experimenta inserir os blocos em posições
+    diferentes e valida sempre com check_solution(check_all=False).
+    Prioriza o número de encomendas e depois os km.
+    Não garante a solução ótima nem o máximo de encomendas.
+
+    max_expansoes é o limite POR pesquisa A* individual/de par.
+    """
+    if max_encomendas < 1 or largura < 1:
+        return None, 0
+
+    veiculos = [v.id for v in problem.vehicles]
+    encomendas = list(problem.orders)
+    total_expandidos = 0
+    blocos_possiveis = []
+
+    # A* para cada encomenda individual.
+    for encomenda in encomendas:
+        for veiculo in problem.vehicles:
+            rota, n = _astar_uma_encomenda(
+                problem, encomenda, veiculo, max_expansoes
+            )
+            total_expandidos += n
+            if rota is not None:
+                blocos_possiveis.append((frozenset((encomenda,)),
+                                        veiculo.id, rota))
+
+    # A* para pares com produtores/clientes próximos. Os pares permitem
+    # intercalar operações e, por isso, aumentar o número de entregas.
+    if max_encomendas >= 2 and vizinhos_pares > 0:
+        pares_vistos = set()
+        for encomenda in encomendas:
+            item_a = problem.request[problem.orders[encomenda][0]]
+            proximidades = []
+            for outra in encomendas:
+                if outra == encomenda:
+                    continue
+                item_b = problem.request[problem.orders[outra][0]]
+                km = (problem.distance(item_a.pickup_location,
+                                       item_b.pickup_location)
+                      + problem.distance(item_a.delivery_location,
+                                         item_b.delivery_location))
+                proximidades.append((km, outra))
+
+            for _, outra in sorted(proximidades)[:vizinhos_pares]:
+                par = tuple(sorted((encomenda, outra)))
+                if par in pares_vistos:
+                    continue
+                pares_vistos.add(par)
+                for veiculo in problem.vehicles:
+                    rota, n = _astar_grupo(
+                        problem, par, veiculo, max_expansoes
+                    )
+                    total_expandidos += n
+                    if rota is not None:
+                        blocos_possiveis.append((frozenset(par),
+                                                veiculo.id, rota))
+
+    def construir_rotas(blocos):
+        return {v: [operacao for _, rota in blocos[v] for operacao in rota]
+                for v in veiculos}
+
+    # Cada solução mantém os blocos de encomendas por veículo.
+    feixe = [(0.0, {v: () for v in veiculos}, frozenset())]
+    melhor = None
+    melhor_quantidade = 0
+    melhor_km = float("inf")
+    validacoes = 0
+    limite_atingido = False
+
+    for _ in range(max_encomendas):
+        candidatos = {}
+        for _, blocos, feitas in feixe:
+            for grupo, veiculo, rota in blocos_possiveis:
+                if grupo & feitas or len(feitas) + len(grupo) > max_encomendas:
+                    continue
+
+                for posicao in range(len(blocos[veiculo]) + 1):
+                    if validacoes >= max_validacoes:
+                        limite_atingido = True
+                        break
+                    novos_blocos = blocos.copy()
+                    novos_blocos[veiculo] = (
+                        blocos[veiculo][:posicao]
+                        + ((grupo, rota),)
+                        + blocos[veiculo][posicao:]
+                    )
+                    assinatura = tuple(
+                        (v, tuple(tuple(sorted(g)) for g, _ in novos_blocos[v]))
+                        for v in veiculos
+                    )
+                    if assinatura in candidatos:
+                        continue
+
+                    solucao = construir_rotas(novos_blocos)
+                    validacoes += 1
+                    valido, km, _ = check_solution(
+                        problem, solucao, check_all=False
+                    )
+                    if valido:
+                        candidatos[assinatura] = (
+                            km, novos_blocos, feitas | grupo
+                        )
+                if limite_atingido:
+                    break
+            if limite_atingido:
+                break
+
+        if not candidatos:
+            break
+
+        feixe = sorted(candidatos.values(),
+                       key=lambda x: (-len(x[2]), x[0]))[:largura]
+        for km, blocos, feitas in feixe:
+            if len(feitas) > melhor_quantidade or (
+                    len(feitas) == melhor_quantidade and km < melhor_km):
+                melhor_quantidade = len(feitas)
+                melhor_km = km
+                melhor = construir_rotas(blocos)
+
+        if melhor_quantidade >= max_encomendas or limite_atingido:
+            break
+
+    return melhor, total_expandidos
